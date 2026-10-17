@@ -25,8 +25,9 @@ Tests use installed Google Chrome, or Playwright Chromium if Chrome is unavailab
 
 ## Controls
 
+- The page opens with the reference camera sequence playing automatically, with sound muted. Use the sound button to unmute during playback, or **Replay reference** to start again with audio. An explicit mute choice is kept for subsequent replays. Reduced-motion preferences, `?paused`, and explicit camera/time URLs skip autoplay.
 - **Play reference** replays the original 4.96-second camera pullback with audio from the linked clip. It starts close to the bow, holds its initial framing, then pans and pulls back into the wide wake. The button resets the scene to the reference settings; press it again to replay.
-- **Sound** beside that button mutes/unmutes the reference audio. **Space** pauses both camera and sound. Choosing another camera stops the sequence; leaving the tab pauses it. At the end, the camera settles into the final wide view and the simulation keeps running. The audio plays once; use **Replay reference** to repeat the camera move and sound.
+- **Sound** beside that button mutes/unmutes the reference audio. **Space** pauses both camera and sound. Choosing another camera stops the sequence; leaving the tab pauses it. At the end, the camera settles into a wide view with space ahead of the bow, and the simulation keeps running. The audio plays once; use **Replay reference** to repeat the camera move and sound.
 - **Tracking** matches the final wide frame: the nose at the left edge, a very small ship, upper lobes, and a broad lower wake.
 - **Bow** matches the early close-up, showing the rounded compression front and refracted starlight ahead of the ship. You can open it directly with `?view=bow`.
 - **Orbit** supports dragging, scrolling to zoom, and right-dragging to pan.
@@ -67,7 +68,7 @@ The browser checks exercise actual GPU rendering, shader compilation, identical 
 
 For repeatable inspection, `?paused` starts paused and `window.warp` exposes `pause()`, `play()`, `seek(seconds)`, `advance(seconds)`, `setView(name)`, `render()`, and a read-only `fieldShape` snapshot. `seek()` reconstructs up to ten seconds of simulation history; `advance()` runs up to sixty seconds of additional fixed simulation steps.
 
-`src/reference-sequence.js` fits global Bezier curves to camera landmarks measured from the clip. These smooth acceleration through the pullback and settle the camera to a stop in the final framing. The audio playback clock drives the camera and world travel during the sequence, so dropped rendering frames cannot accumulate audiovisual drift. After the audio ends, the simulation continues on the animation clock with the camera held wide. Audio starts only after an explicit user action. If audio cannot load or play, the camera sequence continues silently.
+`src/reference-sequence.js` fits global Bezier curves to camera landmarks measured from the clip. These smooth acceleration through the pullback and settle the camera to a stop in the final framing. During audible playback, the audio clock drives the camera and world travel, so dropped rendering frames cannot accumulate audiovisual drift. Automatic playback starts muted on the animation clock; unmuting seeks the audio to the current position and switches clocks without restarting. After the audio ends, the simulation continues on the animation clock with the camera held wide. If audio cannot load or play, the camera sequence continues silently.
 
 Downloaded reference video/frames and development screenshots are ignored by Git and are not included in the build. The short reference audio track is included separately in `public/audio/`.
 

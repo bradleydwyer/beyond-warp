@@ -21,9 +21,9 @@ const state = {
   travel: 12,
   playing: !reducedMotion && !params.has('paused'),
   view: ['tracking','bow','orbit','ride'].includes(params.get('view')) ? params.get('view') : 'tracking',
-  speed: 8,
-  turbulence: .65,
-  intensity: 1,
+  speed: 10,
+  turbulence: 1.5,
+  intensity: 2,
   lensing: .7,
   quality: innerWidth < 700 ? 'low' : 'balanced',
   ship: true,
@@ -34,7 +34,7 @@ let renderer, sceneTarget, composer, camera, orbit, background, world, composite
 let shared, starUniforms, volumeMaterial, bloom, lens, ship, fxaa;
 let previous = performance.now(), frames = 0, fpsStart = previous, fps = 0;
 let noticeTimer, resizing;
-const reference = { active: false, time: 0, loading: false, silent: false, finished: false, revision: 0 };
+const reference = { active: false, time: 0, loading: false, silent: false, finished: false, revision: 0, autoMuted: false };
 const referenceAudio = $('reference-audio');
 referenceAudio.src = `${import.meta.env.BASE_URL}audio/beyond-reference.m4a`;
 referenceAudio.volume = .75;
@@ -192,8 +192,13 @@ function init() {
     render: () => render(0),
   };
   render(0);
-  $('loading').style.opacity = 0;
-  setTimeout(() => { $('loading').hidden = true; }, 650);
+  if (state.playing && !params.has('view') && !params.has('time')) {
+    startReference({ autoplay: true });
+    $('loading').hidden = true;
+  } else {
+    $('loading').style.opacity = 0;
+    setTimeout(() => { $('loading').hidden = true; }, 650);
+  }
   renderer.setAnimationLoop(tick);
 }
 
@@ -227,13 +232,16 @@ function setView(view) {
 function bindControls() {
   $('play').addEventListener('click', togglePlay);
   $('replay').addEventListener('click', restart);
-  $('reference-play').addEventListener('click', startReference);
+  $('reference-play').addEventListener('click', () => startReference());
   $('reference-sound').addEventListener('click', () => {
     referenceAudio.muted = !referenceAudio.muted;
-    $('reference-sound').setAttribute('aria-pressed', String(!referenceAudio.muted));
-    const label = referenceAudio.muted ? 'Unmute reference audio' : 'Mute reference audio';
-    $('reference-sound').setAttribute('aria-label', label);
-    $('reference-sound').title = label;
+    reference.autoMuted = false;
+    updateSound();
+    if (!referenceAudio.muted && reference.active && !reference.finished && reference.silent && !referenceAudio.error) {
+      referenceAudio.currentTime = reference.time;
+      reference.silent = false;
+      if (state.playing) setPlaying(true);
+    }
   });
   referenceAudio.addEventListener('error', () => {
     if (reference.active && !reference.silent) useSilentReference();
@@ -269,11 +277,23 @@ function bindControls() {
   });
 }
 
-function startReference() {
+function updateSound() {
+  $('reference-sound').setAttribute('aria-pressed', String(!referenceAudio.muted));
+  const label = referenceAudio.muted ? 'Unmute reference audio' : 'Mute reference audio';
+  $('reference-sound').setAttribute('aria-label', label);
+  $('reference-sound').title = label;
+}
+
+function startReference({ autoplay = false } = {}) {
   referenceAudio.pause();
   referenceAudio.currentTime = 0;
-  Object.assign(reference, { active: true, time: 0, loading: false, silent: false, finished: false });
-  Object.assign(state, { time: 4, travel: 12, entrance: 1, view: 'reference', speed: 8, turbulence: .65, intensity: 1, lensing: .7, ship: true });
+  if (autoplay || reference.autoMuted) referenceAudio.muted = autoplay;
+  reference.autoMuted = autoplay;
+  updateSound();
+  // Audio-only elements may reject even muted autoplay. Run the initial shot
+  // on the animation clock, then seek/join its audio on an explicit unmute.
+  Object.assign(reference, { active: true, time: 0, loading: false, silent: autoplay, finished: false });
+  Object.assign(state, { time: 4, travel: 12, entrance: 1, view: 'reference', speed: 10, turbulence: 1.5, intensity: 2, lensing: .7, ship: true });
   orbit.enabled = false;
   for (const key of ['speed', 'turbulence', 'intensity', 'lensing']) {
     $(key).value = state[key];
@@ -287,8 +307,10 @@ function startReference() {
   $('reference-time').textContent = '0.00 / 4.96 s';
   $('reference-progress').style.transform = 'scaleX(0)';
   $('reference-play').setAttribute('aria-label', 'Replay reference sequence');
-  fluid.reset();
-  for (let i=0; i<90; i++) fluid.update(1/60, state.speed, state.turbulence);
+  if (!autoplay) {
+    fluid.reset();
+    for (let i=0; i<90; i++) fluid.update(1/60, state.speed, state.turbulence);
+  }
   render(0);
   setPlaying(true);
 }
