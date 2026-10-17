@@ -2,13 +2,14 @@
 
 A real-time WebGL 2 / Three.js interpretation of the side-on warp bubble in [this Star Trek Beyond clip](https://www.youtube.com/watch?v=gCCYWTAA2wQ).
 
-The scene is generated in code: a pointed front feeding several connected, uneven lobes, continuously flowing blue folds, background stars that refract through the field, and a small procedural starship. The reference footage is not used by the renderer.
+The scene is generated in code: a rounded bow feeding several connected, uneven lobes, continuously flowing blue folds, background stars that refract through the field, and a small procedural starship. The reference footage is not used by the renderer.
 
 ## Run
 
 ```sh
-cd /Users/brad/dev/beyond-warp
-npm install
+git clone https://github.com/bradleydwyer/beyond-warp.git
+cd beyond-warp
+npm ci
 npm run dev
 ```
 
@@ -65,3 +66,7 @@ The browser checks exercise actual GPU rendering, shader compilation, identical 
 For repeatable inspection, `?paused` starts paused and `window.warp` exposes `pause()`, `play()`, `seek(seconds)`, `advance(seconds)`, `setView(name)`, `render()`, and a read-only `fieldShape` snapshot. `seek()` reconstructs up to ten seconds of simulation history; `advance()` runs up to sixty seconds of additional fixed simulation steps.
 
 Downloaded reference frames and development screenshots are ignored by Git and are not included in the build.
+
+## License
+
+[MIT](LICENSE) © 2026 Brad Dwyer.
