@@ -29,6 +29,194 @@ float smoothFbm(vec3 p) {
 }
 `;
 
+// Film finish (src/film.js). It runs last, after tone mapping and FXAA, on
+// the display-referred frame, so the antialiasing cannot smear the grain.
+// A half-resolution Gaussian of the finished frame, run twice across and
+// never down, feeds the depth of field and the light on the speed dust: 9
+// taps folded into 5 bilinear ones per pass. Horizontal only, so the
+// defocused star dashes stay thin dashes, as in the clip, instead of
+// spreading into faint smudges.
+export const filmBlurFragment = /* glsl */`
+uniform sampler2D tDiffuse;
+uniform vec2 uStep;
+varying vec2 vUv;
+void main() {
+  vec3 c=texture2D(tDiffuse,vUv).rgb*.2270270;
+  c+=(texture2D(tDiffuse,vUv+uStep*1.3846154).rgb+texture2D(tDiffuse,vUv-uStep*1.3846154).rgb)*.3162162;
+  c+=(texture2D(tDiffuse,vUv+uStep*3.2307692).rgb+texture2D(tDiffuse,vUv-uStep*3.2307692).rgb)*.0702703;
+  gl_FragColor=vec4(c,1.0);
+}`;
+
+export const filmFragment = /* glsl */`
+${noise}
+uniform sampler2D tDiffuse, tBlur, uProfile;
+uniform vec2 uResolution, uDustFlow;
+uniform mat4 uInverseProjection, uCameraMatrix;
+uniform vec3 uCameraPosition;
+uniform vec4 uDustPhase;
+uniform float uGrain, uSoftness, uFocus, uDust, uGrade, uLetterbox;
+uniform float uFrame, uFocusNear, uDustNear;
+varying vec2 vUv;
+const float FIELD_LENGTH=390.0;
+const vec3 LUMA=vec3(.2126,.7152,.0722);
+
+// Integer hash: the same seed always gives the same grain, so a paused frame
+// is bit-identical; the seed is the simulation frame, never the wall clock.
+uint hash3(uvec3 v) {
+  v=v*1664525u+1013904223u;
+  v.x+=v.y*v.z; v.y+=v.z*v.x; v.z+=v.x*v.y;
+  v^=v>>16u;
+  v.x+=v.y*v.z; v.y+=v.z*v.x; v.z+=v.x*v.y;
+  return v.x^v.y^v.z;
+}
+float random(vec2 cell,float layer) {
+  uvec3 v=uvec3(ivec3(cell+16384.0,layer));
+  return float(hash3(v)>>8)/16777216.0;
+}
+// Fine, soft grain: two layers of value noise on lattices a little over a
+// pixel across, turned off the pixel grid so no rows or columns show.
+float grainAt(vec2 pixel) {
+  float cell=max(1.0,uResolution.y/420.0);
+  float g=0.0;
+  for (int i=0;i<2;i++) {
+    vec2 p=(i==0?mat2(.8,-.6,.6,.8):mat2(.28,.96,-.96,.28))*pixel/cell;
+    vec2 c=floor(p), f=fract(p);
+    f=f*f*(3.0-2.0*f);
+    float layer=mod(uFrame,4096.0)*2.0+float(i);
+    float a=random(c,layer), b=random(c+vec2(1.0,0.0),layer);
+    float d=random(c+vec2(0.0,1.0),layer), e=random(c+vec2(1.0,1.0),layer);
+    g+=mix(mix(a,b,f.x),mix(d,e,f.x),f.y);
+  }
+  return g-1.0;
+}
+
+// How far this pixel's view ray passes from the warp field, in local field
+// radii: small on the field (in focus), large for the space beyond it.
+float fieldDistance(vec2 uv) {
+  vec4 view=uInverseProjection*vec4(uv*2.0-1.0,1.0,1.0);
+  vec3 d=normalize(mat3(uCameraMatrix)*view.xyz), o=uCameraPosition;
+  float across=d.y*d.y+d.z*d.z;
+  float t=across>1e-6?max(0.0,-(o.y*d.y+o.z*d.z)/across):0.0;
+  vec3 p=o+d*t;
+  float x=clamp(p.x,0.0,FIELD_LENGTH);
+  vec4 size=texture2D(uProfile,vec2((x/FIELD_LENGTH*1023.0+.5)/1024.0,.5));
+  float radius=max(x<10.0?sqrt(2.7*x):max(size.x,size.y),1.5);
+  return length(vec3(p.x-x,p.y,p.z))/radius;
+}
+
+// Out-of-focus gas close to the lens, smeared along the flight by the
+// shutter. Three depths (nearer is larger and brighter) and a faint veil.
+// It moves only with travelled distance, along the on-screen flight path.
+// rgb: the light it adds; a: how much its haze greys the colours behind it.
+// The light is mostly in distinct blobs; the veil only greys the colours a
+// little, so the frame gains soft shapes rather than a smoky grey cast.
+vec4 speedDust(vec2 uv,vec3 ambient) {
+  float flow=length(uDustFlow);
+  if (flow<.05) return vec4(0.0);
+  vec2 f=uDustFlow/flow;
+  vec2 s=(uv-.5)*vec2(uResolution.x/uResolution.y,1.0);
+  float a=dot(s,f), b=dot(s,vec2(-f.y,f.x));
+  // The gas belongs with the banks below the field, so it is denser low.
+  float low=mix(1.0,.22,smoothstep(-.30,.25,b));
+  vec3 dust=vec3(0.0);
+  for (int i=0;i<3;i++) {
+    float k=float(i)*.5;
+    vec2 scale=vec2(mix(.9,2.2,k),mix(4.0,9.0,k));
+    vec3 p=vec3(a*scale.x-uDustPhase[i],b*scale.y+float(i)*9.7,7.0+float(i)*19.0);
+    vec4 n=smoothLattice(p);
+    vec4 m=smoothLattice(p*vec3(2.0,2.4,1.0)+vec3(3.1,1.7,5.3));
+    // Sparse, distinct clumps with soft edges and brighter, smeared cores.
+    // The nearest layer has the fewest, largest and brightest clumps.
+    float body=n.r*.66+m.r*.34;
+    float blob=i==0?smoothstep(.64,.78,body):smoothstep(.63,.80,body);
+    blob*=.55+.45*smoothstep(.70,.86,body)+.5*smoothstep(.55,.85,m.g);
+    vec3 tint=mix(vec3(.50,.62,.78),vec3(.60,.62,.64),smoothstep(.55,.80,n.b));
+    dust+=tint*blob*low*(i==0?1.5:mix(.75,.35,k));
+  }
+  float veil=smoothstep(.30,.85,smoothNoise(vec3(a*.55-uDustPhase.w,b*1.6,61.0)));
+  dust+=vec3(.10,.14,.18)*.25*veil*mix(.5,1.0,low);
+  // Lit only by the space around it, near and across the frame: brighter
+  // against the bright banks, faint over the dark interiors, and invisible
+  // if space is black, so it never reads as a grey smudge on the lens.
+  float light=3.0*dot(ambient,LUMA);
+  float amount=uDust*uDustNear*flow;
+  return vec4(dust*light*amount,min(amount*(.06+.14*veil),.22));
+}
+
+// Blue toward teal with occasional magenta. Every step keeps black at
+// black, so the black-level lift (done once, in liftBlacks) is not repeated.
+vec3 grade(vec3 c) {
+  float l=dot(c,LUMA);
+  vec3 t=c;
+  // Teal: red is pulled out of the blues (toward cyan), and a little blue
+  // moves into green. The same red axis pushes the pink-violet gas further
+  // toward magenta, so magenta appears only where the gas already has it.
+  t.r+=.32*(c.r-l);
+  float shift=(c.b-c.g)*.09;
+  t.g+=shift; t.b-=shift;
+  // Pulling red out darkens the blue sky a little; that brightness is put
+  // back, so the grade does not dim the frame (black stays black). Where the
+  // shift into green already brightens a strongly saturated blue, it is left
+  // as it is: scaling that back down would dim the blue channel itself.
+  t=max(t,vec3(0.0));
+  t*=max(1.0,l/max(dot(t,LUMA),1e-4));
+  // Close to the field (the opening of the reference sequence, the bow
+  // view) everything is seen through the near gas, so the grade is greyer
+  // there, as in the clip's opening; the wide shots keep their saturated
+  // blue. Elsewhere only the most saturated colour is tamed. The deep
+  // shadows keep Black level's blue.
+  float haze=.35*uFocusNear*smoothstep(.03,.15,l);
+  float chroma=max(t.r,max(t.g,t.b))-min(t.r,min(t.g,t.b));
+  t=mix(vec3(dot(t,LUMA)),t,(1.0-haze)*(1.0-.25*smoothstep(.45,.90,chroma)));
+  // No highlight shoulder here: the filmic tone mapping before FXAA already
+  // rolls the highlights off, and a second shoulder capped white at about
+  // 80%, greying the hero flash and the brightest crest.
+  return max(t,vec3(0.0));
+}
+
+void main() {
+  vec2 uv=vUv;
+  vec2 texel=1.0/uResolution;
+  vec3 c=texture2D(tDiffuse,uv).rgb;
+  // Softness everywhere, plus depth of field away from the field. The focus
+  // follows the camera: close to the field, the space beyond it is far out.
+  // At the defaults the two together stay within the fine 4-tap blend, so
+  // the thin star dashes stay distinct; only Depth of field above 100% mixes
+  // in the wider half-resolution blur (horizontal, so dashes stay dashes).
+  float blur=min(uSoftness*.4,1.0);
+  if (uFocus>0.0 && uFocusNear>0.0) blur+=uFocus*uFocusNear*.6*smoothstep(1.2,3.2,fieldDistance(uv));
+  if (blur>0.0) {
+    vec3 soft=(texture2D(tDiffuse,uv+texel*vec2(.5,.75)).rgb+texture2D(tDiffuse,uv+texel*vec2(-.75,.5)).rgb
+      +texture2D(tDiffuse,uv+texel*vec2(-.5,-.75)).rgb+texture2D(tDiffuse,uv+texel*vec2(.75,-.5)).rgb)*.25;
+    c=blur<=1.0?mix(c,soft,blur):mix(soft,texture2D(tBlur,uv).rgb,min(blur-1.0,1.0));
+  }
+  if (uDust>0.0 && uDustNear>0.0) {
+    // The near gas veils the colours behind it, then adds its own light.
+    vec3 frame=vec3(0.0);
+    for (int i=0;i<9;i++) frame+=texture2D(tBlur,vec2(.2+.3*float(i%3),.25+.25*float(i/3))).rgb/9.0;
+    vec4 dust=speedDust(uv,texture2D(tBlur,uv).rgb*.55+frame*.45);
+    c=mix(c,vec3(dot(c,LUMA)),dust.a)+dust.rgb*(1.0-c);
+  }
+  if (uGrade>0.0) c=mix(c,grade(c),uGrade);
+  // The vignette is not here: it is optical, so the lens pass applies it
+  // once, in scene light (see Lens › Vignette).
+  float bar=uLetterbox;
+  if (uGrain>0.0) {
+    // Multiplicative, so black stays black; strongest in the mid-tones.
+    float l=dot(c,LUMA);
+    c*=1.0+uGrain*.05*grainAt(gl_FragCoord.xy)*smoothstep(.0,.10,l)*(1.0-.55*l);
+    // A zero-mean, sub-level dither breaks the banding in the deep shadows.
+    // It fades out at pure black, where clipping would bias it upward.
+    float dither=random(gl_FragCoord.xy,uFrame*2.0+8191.0)+random(gl_FragCoord.xy+vec2(733.0,211.0),uFrame*2.0+8191.0)-1.0;
+    c+=dither*min(uGrain,1.0)*clamp(l*127.5,0.0,1.0)/255.0;
+  }
+  if (bar>0.0) {
+    float edge=min(uv.y,1.0-uv.y)*uResolution.y-bar*uResolution.y;
+    c=mix(vec3(.012,.035,.043),c,clamp(edge+.5,0.0,1.0));
+  }
+  gl_FragColor=vec4(clamp(c,0.0,1.0),1.0);
+}`;
+
 // A brighter, filamentary nebula for the backdrop. Two levels of domain
 // warping fold the fbm into banks, wisps and dark dust lanes; it is fixed in
 // the passing world (only travelled distance moves it) and denser below the
@@ -172,6 +360,9 @@ void main() {
   gl_FragColor=vec4(col,1.0);
 }`;
 
+// Star streaks (STAR_STREAKS defined) stretch the brightest stars sideways.
+// Without the define the shaders are exactly the original ones: even an
+// inactive branch changed how the GPU compiler rounded the star quads.
 export const starVertex = /* glsl */`
 attribute vec4 aSeed;
 uniform float uTravel;
@@ -180,6 +371,11 @@ varying vec2 vUv;
 varying vec3 vColor;
 varying float vAlpha;
 varying float vForeground;
+#ifdef STAR_STREAKS
+uniform float uStarStreak;
+varying float vStretch;
+varying float vHot;
+#endif
 void main() {
   vUv = uv;
   float speed = .55 + aSeed.w * 1.5;
@@ -199,7 +395,22 @@ void main() {
   vec4 center = modelViewMatrix * vec4(world, 1.0);
   vec3 dir = mat3(modelViewMatrix) * vec3(1.0, 0.0, 0.0);
   vec2 side = normalize(vec2(-dir.y, dir.x) + .0001);
+#ifdef STAR_STREAKS
+  // Anamorphic star streaks: the sparse brightest stars reach well beyond
+  // their shutter trail (by a fixed angle, so it does not depend on speed),
+  // which leaves room for the long thin line their core is spread along.
+  // An anamorphic lens streaks sideways on screen, so this fades out as the
+  // flight turns away from screen-horizontal (looking down on the field in
+  // Orbit, or along it in Ride), where the horizontal streak bloom alone
+  // carries the look. dir is a unit vector: x is its sideways share.
+  float sideways = smoothstep(.3, .8, abs(dir.x));
+  vHot = pow(aSeed.w, 60.0) * sideways;
+  float reach = len + uStarStreak * vHot * length(center.xyz) * .085;
+  vStretch = reach / len;
+  center.xyz += dir * position.x * reach;
+#else
   center.xyz += dir * position.x * len;
+#endif
   center.xy += side * position.y * (.65 + pow(aSeed.w, 4.0) * 1.65);
   gl_Position = projectionMatrix * center;
   vColor = mix(vec3(.26, .64, .85), vec3(.98, 1.0, .90), aSeed.w);
@@ -214,16 +425,90 @@ varying vec2 vUv;
 varying vec3 vColor;
 varying float vAlpha;
 varying float vForeground;
+#ifdef STAR_STREAKS
+uniform float uStarStreak;
+varying float vStretch;
+varying float vHot;
+#endif
 void main() {
   if (abs(vForeground-uForeground)>.5) discard;
   vec2 p = abs(vUv * 2.0 - 1.0);
+#ifdef STAR_STREAKS
+  // The shutter trail keeps its own length inside the stretched quad.
+  float tail = pow(max(0.0, 1.0 - p.x * vStretch), 1.3);
+#else
   float tail = pow(max(0.0, 1.0 - p.x), 1.3);
+#endif
   // Filter the bright core over a pixel footprint to prevent subpixel sparkle.
   float width = sqrt(.0036 + pow(fwidth(vUv.y*2.0), 2.0) / 12.0);
   float core = exp(-p.y*p.y/(width*width)) * (.06/width);
   float halo = exp(-p.y*p.y*6.0);
+#ifdef STAR_STREAKS
+  // A bright point through an anamorphic lens: less of the core stays in
+  // the hot centre (which the round HDR bloom turned into a blob), and it
+  // is spread along a long, thin horizontal line instead. The soft halo
+  // narrows across the streak and follows it out.
+  float k = min(uStarStreak, 1.5) * vHot;
+  float line = pow(max(0.0, 1.0 - p.x), 2.4);
+  float thin = exp(-p.y*p.y*6.0*(1.0 + 5.0*k));
+  float lineCore = exp(-p.y*p.y/(width*width*.6)) * (.06/width);
+  float radiance = tail * core*12.0*(1.0 - .65*min(k, 1.0))
+    + line * lineCore*12.0*.45*k
+    + mix(tail, line, min(k, 1.0)) * mix(halo, thin, min(k, 1.0)) * .55*(uBloom/.65);
+#else
   float radiance = tail * (core*12.0 + halo*.55*(uBloom/.65));
+#endif
   gl_FragColor = vec4(vColor*radiance, vAlpha);
+}`;
+
+// Hero sources: a few very bright, deterministic stars that pass behind the
+// field. Each is a compact point with a short shutter trail; its size is a
+// fixed angle, so it reads as a point source at any distance.
+export const heroVertex = /* glsl */`
+attribute vec4 aHero;     // phase, height, depth, speed
+attribute vec4 aHeroLook; // period, size, warmth, brightness
+uniform float uTravel, uVelocity, uHeroGain;
+varying vec2 vUv;
+varying vec3 vColor;
+varying float vForeground, vTrail, vGain;
+void main() {
+  vUv = uv;
+  vec3 world = vec3(mod(aHero.x + uTravel * aHero.w, aHeroLook.x) - aHeroLook.x * .5, aHero.y, aHero.z);
+  // The same split as the stars: in front of the field it is composited
+  // afterwards, so the field cannot bend it.
+  vec3 toHero = world - cameraPosition;
+  vec3 inv = 1.0 / (normalize(toHero) + vec3(.000001));
+  vec3 entry = (vec3(-3.0, -65.0, -70.0) - cameraPosition) * inv;
+  vec3 exit = (vec3(390.0, 65.0, 70.0) - cameraPosition) * inv;
+  vec3 lo = min(entry, exit), hi = max(entry, exit);
+  float nearT = max(max(lo.x, lo.y), lo.z), farT = min(min(hi.x, hi.y), hi.z);
+  vForeground = farT > max(nearT, 0.0) && length(toHero) < nearT ? 1.0 : 0.0;
+  vec4 center = modelViewMatrix * vec4(world, 1.0);
+  float size = length(center.xyz) * .011 * aHeroLook.y;
+  float len = .25 * uVelocity * aHero.w * .028;
+  vec3 dir = mat3(modelViewMatrix) * vec3(1.0, 0.0, 0.0);
+  vec2 side = normalize(vec2(-dir.y, dir.x) + .0001);
+  center.xyz += dir * position.x * (len + size);
+  center.xy += side * position.y * size;
+  vTrail = len / (len + size);
+  gl_Position = projectionMatrix * center;
+  vColor = mix(vec3(.82, .92, 1.0), vec3(1.0, .86, .93), aHeroLook.z);
+  vGain = aHeroLook.w * uHeroGain;
+}`;
+
+export const heroFragment = /* glsl */`
+uniform float uForeground;
+varying vec2 vUv;
+varying vec3 vColor;
+varying float vForeground, vTrail, vGain;
+void main() {
+  if (abs(vForeground-uForeground)>.5) discard;
+  vec2 p = abs(vUv * 2.0 - 1.0);
+  // Distance from the trail segment, in units of the source's size.
+  float along = max(p.x - vTrail, 0.0) / max(1.0 - vTrail, .001);
+  float r2 = along * along + p.y * p.y;
+  float radiance = exp(-r2 * 16.0) * 1.6 + exp(-r2 * 4.5) * .22;
+  gl_FragColor = vec4(vColor * radiance * vGain, 1.0);
 }`;
 
 // The visible view sits inside a larger background capture. A camera-centred
@@ -294,6 +579,8 @@ vec3 knee(vec3 c, float start, float range) {
 }
 // Lift the darkest space to a deep blue rather than black. Applied once, to
 // the final field composite, so the light the field gathers never includes it.
+// The lens pass's Vignette darkens the corners down to this same floor colour
+// and no further (keep the two in step).
 vec3 liftBlacks(vec3 c) {
   float level=dot(c,vec3(.2126,.7152,.0722));
   return c+uBlackLevel*vec3(.0042,.0068,.0105)*(1.0-smoothstep(0.0,.03,level));
@@ -1005,6 +1292,30 @@ vec3 illuminateBand(vec3 base, vec2 screenNormal, vec3 worldNormal,
   return color+glow*(core+halo)*fade*uEntrance*uIntensity*strength*shade;
 }
 
+// Hero sources (screen uv, brightness, radius in screen heights). A bright
+// source just behind the shell is focused into the edge around it, so a short
+// arc of the rim flashes as the source crosses it, splitting into an upper and
+// a lower arc once it is behind the bubble. Added after the knees on purpose:
+// it is a brief caustic, and the lens bloom and streak spread it.
+uniform vec4 uHeroCaustic[HERO_COUNT];
+vec3 heroCaustic(float rimPixels, float fade) {
+  float scale=uResolution.y/536.0;
+  float rim2=rimPixels*rimPixels/(scale*scale);
+  // A thin lit arc either side of the source, and a broader, much hotter
+  // focus where the edge passes closest to it.
+  float arc=exp(-rim2/20.0), focus=exp(-rim2/110.0);
+  if (focus<.002 || fade<=0.0) return vec3(0.0);
+  vec3 light=vec3(0.0);
+  for (int i=0;i<HERO_COUNT;i++) {
+    vec4 hero=uHeroCaustic[i];
+    if (hero.z<=0.0) continue;
+    vec2 d=(vUv-hero.xy)*vec2(uResolution.x/uResolution.y,1.0)/hero.w;
+    float r2=dot(d,d);
+    light+=hero.z*(vec3(.96,.88,1.0)*exp(-r2)*arc*.22+vec3(.95,.98,1.0)*exp(-r2*12.0)*focus);
+  }
+  return light*fade;
+}
+
 // Compressed glow mixes in the light gathered from all around the field;
 // Compressed space reflects only the space above the crest and the sky
 // around the camera, so dark surroundings still leave it dark.
@@ -1148,31 +1459,59 @@ void main() {
   float centerFade=smoothstep(6.2,8.5,axis.x)*tailFade(axis.x);
   centerFade*=1.0-smoothstep(.85,.98,abs(originalDirection.x));
   color=illuminateBand(color,axisNormal,vec3(0.0,1.0,0.0),centerAcross,halfWidth,centerFade,.38,0.0,1.0,1.0,color);
+  color+=heroCaustic(abs(closest)/worldPixel,fade);
   gl_FragColor=vec4(liftBlacks(color),1.0);
 }`;
 
 export const lensFragment = /* glsl */`
-uniform sampler2D tDiffuse;
+uniform sampler2D tDiffuse, tStreak;
 uniform float uTime;
 uniform float uBloom;
-uniform vec2 uResolution;
+uniform float uOldFlare, uStreak, uVignette, uLetterbox, uBlackLevel;
+uniform vec2 uResolution, uStreakTexel;
 varying vec2 vUv;
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-void main() {
-  vec2 p = vUv - .5;
-  vec2 aberration = p * dot(p, p) * .0016;
-  vec3 c = texture2D(tDiffuse, vUv).rgb;
-  c.r = texture2D(tDiffuse, vUv + aberration).r;
-  c.b = texture2D(tDiffuse, vUv - aberration).b;
-  // A faint horizontal optical bloom; the main bloom is handled in HDR.
+vec3 oldFlare() {
   vec3 flare = vec3(0.0);
   for (int i = 1; i <= 5; i++) {
     vec2 o = vec2(float(i) * .012, 0.0);
     flare += max(texture2D(tDiffuse, vUv + o).rgb - .52, 0.0) / float(i + 1);
     flare += max(texture2D(tDiffuse, vUv - o).rgb - .52, 0.0) / float(i + 1);
   }
-  c += flare * vec3(.04, .08, .15) * (uBloom/.65);
-  c *= 1.0 - .45 * dot(p * vec2(.85, 1.0), p);
-  // No animated grain: stable highlights matter more than a film overlay here.
+  return flare;
+}
+void main() {
+  vec2 p = vUv - .5;
+  vec2 aberration = p * dot(p, p) * .0016;
+  vec3 c = texture2D(tDiffuse, vUv).rgb;
+  c.r = texture2D(tDiffuse, vUv + aberration).r;
+  c.b = texture2D(tDiffuse, vUv - aberration).b;
+  // The original faint five-tap horizontal flare. The anamorphic streak bloom
+  // replaces it, so it only remains while Streak bloom is at (or near) 0%,
+  // where it is evaluated exactly as before.
+  if (uOldFlare >= 1.0) c += oldFlare() * vec3(.04, .08, .15) * (uBloom/.65);
+  else if (uOldFlare > 0.0) c += oldFlare() * vec3(.04, .08, .15) * (uBloom/.65) * uOldFlare;
+  // Anamorphic streak bloom, computed at reduced resolution from the HDR frame
+  // before the round bloom; a final 3-tap pass smooths its upsampling.
+  if (uStreak > 0.0) {
+    float dx = uStreakTexel.x * 1.5;
+    vec3 streak = texture2D(tStreak, vUv - vec2(dx, 0.0)).rgb * .25 + texture2D(tStreak, vUv).rgb * .5
+      + texture2D(tStreak, vUv + vec2(dx, 0.0)).rgb * .25;
+    c += streak * uStreak;
+  }
+  // One vignette, in scene light like a real lens's. The original gentle
+  // falloff is evaluated exactly as before; Vignette deepens the corners on
+  // top of it, following the 2.39:1 picture inside the letterbox. It starts
+  // well out from the centre, so the middle of the frame keeps its light, and
+  // it darkens the corners only down to Black level's deep-blue floor, never
+  // below it (the floor is the colour liftBlacks adds to black).
+  float vignette = 1.0 - .45 * dot(p * vec2(.85, 1.0), p);
+  c *= vignette;
+  if (uVignette > 0.0) {
+    vec2 q = vec2(p.x, p.y / max(1.0 - 2.0 * uLetterbox, .01)) * 2.0;
+    float deeper = exp(-uVignette * .42 * smoothstep(.5, 2.0, dot(q, q * vec2(.8, 1.0))));
+    c = max(c * deeper, min(c, uBlackLevel * vec3(.0042, .0068, .0105)));
+  }
+  // Grain lives in the film pass, after FXAA, where it cannot be smeared.
   gl_FragColor = vec4(max(c, vec3(0.0)), 1.0);
 }`;

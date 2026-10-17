@@ -6,7 +6,7 @@ import { REFERENCE_DURATION, referenceCameraAt } from '../src/reference-sequence
 import { checkOpticalLight } from './optical-light.mjs';
 import { checkViewportRefraction } from './viewport-refraction.mjs';
 import { checkFlybyPath, checkFlybyPlayback } from './flyby.mjs';
-import { checkEffects, checkEffectsLayout } from './effects.mjs';
+import { checkEffects, checkEffectsLayout, checkLens } from './effects.mjs';
 import { WarpField, FIELD_LENGTH } from '../src/field.js';
 
 const port = Number(process.env.SMOKE_PORT) || 5176;
@@ -328,6 +328,7 @@ try {
   await checkViewportRefraction(browser, `http://127.0.0.1:${port}`);
   await checkEffects(browser, `http://127.0.0.1:${port}`);
   await checkEffectsLayout(browser, `http://127.0.0.1:${port}`);
+  await checkLens(browser, `http://127.0.0.1:${port}`);
   assert.deepEqual(errors, [], `Browser errors: ${errors.join('\n')}`);
   console.log('All visual smoke checks passed.');
 } finally {

@@ -6,8 +6,10 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
-import { fullscreenVertex, backgroundFragment, starVertex, starFragment, volumeFragment, fluidVolumeFragment, lensFragment } from './shaders.js';
+import { fullscreenVertex, backgroundFragment, starVertex, starFragment, heroVertex, heroFragment, volumeFragment, fluidVolumeFragment, lensFragment } from './shaders.js';
+import { StreakBloomPass, HeroFlashPass } from './streak.js';
 import { createShip } from './ship.js';
+import { FilmPass } from './film.js';
 import { ShellFluid } from './fluid.js';
 import { WarpField, FIELD_LENGTH } from './field.js';
 import { REFERENCE_DURATION, referenceCameraAt } from './reference-sequence.js';
@@ -42,6 +44,8 @@ const EFFECTS = {
   nebula: 1, nebulaDensity: 1, nebulaGlow: 1, blackLevel: 1,
   interior: .92, interiorShrink: .6, crestThickness: 1, crestLight: .85, crestVariation: 1,
   energyRim: true,
+  streak: 1, streakLength: .75, streakTint: .8, heroFlares: 1, starStreaks: 1,
+  grain: 1, softness: 1, focus: 1, dust: 1, grade: 1, vignette: 1, letterbox: true,
 };
 const EFFECT_SLIDERS = Object.keys(EFFECTS).filter(key => typeof EFFECTS[key] === 'number');
 const EFFECT_TOGGLES = Object.keys(EFFECTS).filter(key => typeof EFFECTS[key] === 'boolean');
@@ -62,10 +66,32 @@ state.effectsBypass = readParam('effectsBypass', false);
 const effectValue = key => state.effectsBypass ? (typeof EFFECTS[key] === 'boolean' ? false : 0) : state[key];
 let renderer, sceneTarget, composer, camera, orbit, background, world, foreground, composite, shipScene, fluid, field;
 let shared, starUniforms, volumeMaterial, bloom, lens, ship, fxaa, starMesh, farStars;
+let streak, heroFlash, heroUniforms, heroMesh, starStreaksOn = false;
+const starMaterials = [], heroCopies = [];
 let lightTarget, lightCamera, lightScene, lightKey = '';
+let film;
 let sceneCamera, offscreenTarget, offscreenCamera, offscreenKey = '';
 const SCENE_OVERSCAN = 1.8;
 const STAR_COUNT = 7200, FAR_STAR_COUNT = 1200;
+// Hero sources: [phase, height, depth, speed, period, size, warmth, brightness].
+// x = mod(phase + travel*speed, period) - period/2, like the stars. The first
+// is placed so the reference camera, unchanged, finds it crossing the rounded
+// bow at 2.0 s (travel 812), about 16 px above the centre line so its streak
+// runs beside the centre stream rather than along it; the wide and bow views
+// meet it at the bow tip too. The other two are dimmer and stay out of the
+// reference shot and the default still (travel 12): they pass above the
+// crests and below the lower edges of the wide view now and then, as bright
+// streaking stars. The field's edges there are nearly level, so they would
+// only graze them, and a grazing pass does not flash (see updateHeroes).
+const HEROES = [
+  [1664.6, .216, -300, .55, 4400, 1, .15, 1],
+  [3040, 92, -200, .8, 5200, .9, .6, .6],
+  [539, -118, -250, .7, 6100, 1.1, .3, .7],
+];
+const HERO_CAUSTIC = 2.0, HERO_RADIUS = .08, HERO_FLASH = 1.4, HERO_FLASH_WIDTH = .05, STREAK_GAIN = 10;
+// |sin| of the angle between a hero's path and the edge it is crossing:
+// below the first value it does not flash at all, above the second fully.
+const HERO_CROSSING = [.25, .6];
 let previous = performance.now(), frames = 0, fpsStart = previous, fps = 0;
 let noticeTimer, resizing;
 const reference = { active: false, time: 0, loading: false, silent: false, finished: false, revision: 0, autoMuted: false };
@@ -118,13 +144,15 @@ function makeStars() {
   }
   geometry.setAttribute('aSeed', new THREE.InstancedBufferAttribute(seeds, 4));
   geometry.instanceCount = STAR_COUNT;
-  starUniforms = { uTravel: { value: state.travel }, uVelocity: { value: spaceVelocity() }, uBloom: { value: state.bloom }, uForeground: { value: 0 } };
+  starUniforms = { uTravel: { value: state.travel }, uVelocity: { value: spaceVelocity() }, uBloom: { value: state.bloom }, uForeground: { value: 0 }, uStarStreak: { value: state.starStreaks } };
   const material = new THREE.ShaderMaterial({ vertexShader: starVertex, fragmentShader: starFragment, uniforms: starUniforms, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+  starMaterials.push(material);
   starMesh = new THREE.Mesh(geometry, material);
   starMesh.frustumCulled = false; world.add(starMesh);
   const foregroundMaterial = material.clone();
   foregroundMaterial.uniforms = { ...starUniforms, uForeground: { value: 1 } };
   foregroundMaterial.depthTest = false;
+  starMaterials.push(foregroundMaterial);
   const foregroundStars = new THREE.Mesh(geometry, foregroundMaterial);
   foregroundStars.frustumCulled = false;
   foreground.add(foregroundStars);
@@ -137,6 +165,116 @@ function makeStars() {
   const points = new THREE.BufferGeometry(); points.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   farStars = new THREE.Points(points, new THREE.PointsMaterial({ color: 0x6093aa, size: .18, transparent: true, opacity: .42, depthWrite: false }));
   world.add(farStars);
+}
+
+function makeHeroes() {
+  const base = new THREE.PlaneGeometry(2, 2);
+  const geometry = new THREE.InstancedBufferGeometry();
+  geometry.index = base.index; geometry.attributes.position = base.attributes.position; geometry.attributes.uv = base.attributes.uv;
+  geometry.setAttribute('aHero', new THREE.InstancedBufferAttribute(new Float32Array(HEROES.flatMap(hero => hero.slice(0, 4))), 4));
+  geometry.setAttribute('aHeroLook', new THREE.InstancedBufferAttribute(new Float32Array(HEROES.flatMap(hero => hero.slice(4, 8))), 4));
+  geometry.instanceCount = HEROES.length;
+  heroUniforms = { uTravel: starUniforms.uTravel, uVelocity: starUniforms.uVelocity, uHeroGain: { value: state.heroFlares }, uForeground: { value: 0 } };
+  const material = new THREE.ShaderMaterial({ vertexShader: heroVertex, fragmentShader: heroFragment, uniforms: heroUniforms, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+  heroMesh = new THREE.Mesh(geometry, material);
+  heroMesh.frustumCulled = false; world.add(heroMesh);
+  const foregroundMaterial = material.clone();
+  foregroundMaterial.uniforms = { ...heroUniforms, uForeground: { value: 1 } };
+  foregroundMaterial.depthTest = false;
+  const foregroundHeroes = new THREE.Mesh(geometry, foregroundMaterial);
+  foregroundHeroes.frustumCulled = false; foreground.add(foregroundHeroes);
+  heroCopies.push(heroMesh, foregroundHeroes);
+}
+
+// Where each hero source is on screen, for the caustic it focuses into the
+// field's edge. Only a source seen across the field (behind it) is focused.
+const heroPoint = new THREE.Vector3(), heroAhead = new THREE.Vector3(), edgePoint = new THREE.Vector3();
+// The field's upper and lower silhouette on screen, in screen heights:
+// x, y and depth for each of 65 samples, crowded toward the rounded bow,
+// where the edge turns fastest. Preallocated, as it is redrawn every frame.
+const SILHOUETTE_SAMPLES = 65;
+const silhouette = [new Float64Array(SILHOUETTE_SAMPLES * 3), new Float64Array(SILHOUETTE_SAMPLES * 3)];
+const closest = { distance: Infinity, tx: 1, ty: 0 };
+function projectSilhouette() {
+  const aspect = camera.aspect;
+  for (let k = 0; k < SILHOUETTE_SAMPLES; k++) {
+    const x = FIELD_LENGTH * (k / (SILHOUETTE_SAMPLES - 1)) ** 2;
+    const i = Math.min(1023, Math.round(x / FIELD_LENGTH * 1023));
+    for (let side = 0; side < 2; side++) {
+      edgePoint.set(x, (side ? -1 : 1) * field.data[i * 4 + side], 0).project(camera);
+      silhouette[side][k * 3] = edgePoint.x * .5 * aspect;
+      silhouette[side][k * 3 + 1] = edgePoint.y * .5;
+      silhouette[side][k * 3 + 2] = edgePoint.z;
+    }
+  }
+}
+// The distance from a screen point to the nearest silhouette segment, and
+// that segment's direction (unit length), in `closest`.
+function silhouetteDistance(px, py) {
+  closest.distance = Infinity;
+  for (const edge of silhouette) {
+    for (let k = 1; k < SILHOUETTE_SAMPLES; k++) {
+      const ax = edge[k * 3 - 3], ay = edge[k * 3 - 2], az = edge[k * 3 - 1];
+      const bx = edge[k * 3], by = edge[k * 3 + 1], bz = edge[k * 3 + 2];
+      if (Math.abs(az) >= 1 || Math.abs(bz) >= 1) continue;
+      const dx = bx - ax, dy = by - ay, length2 = dx * dx + dy * dy;
+      const t = THREE.MathUtils.clamp(((px - ax) * dx + (py - ay) * dy) / Math.max(length2, 1e-12), 0, 1);
+      const distance = Math.hypot(px - ax - dx * t, py - ay - dy * t);
+      if (distance < closest.distance && length2 > 1e-14) {
+        const length = Math.sqrt(length2);
+        closest.distance = distance; closest.tx = dx / length; closest.ty = dy / length;
+      }
+    }
+  }
+  return closest.distance;
+}
+// Per-hero screen position, flash and crossing steepness, for the test API.
+const heroReadout = HEROES.map(() => ({ x: 0, y: 0, flash: 0, crossing: 0, onScreen: false }));
+function updateHeroes() {
+  // Hero sources are stars too, so Star density at 0% removes them as well.
+  const gain = state.stars > 0 ? effectValue('heroFlares') : 0;
+  heroUniforms.uHeroGain.value = gain;
+  for (const mesh of heroCopies) mesh.visible = gain > 0;
+  const caustics = volumeMaterial.uniforms.uHeroCaustic.value;
+  const aspect = camera.aspect;
+  let flashing = false, projected = false;
+  for (let i = 0; i < HEROES.length; i++) {
+    const [phase, y, z, speed, period, , , brightness] = HEROES[i];
+    const along = phase + state.travel * speed;
+    const x = along - period * Math.floor(along / period) - period / 2;
+    heroPoint.set(x, y, z);
+    // Where it will be a little further on: its direction across the screen.
+    heroAhead.set(x + 4, y, z).project(camera);
+    const behind = camera.position.z * z < 0;
+    heroPoint.project(camera);
+    const onScreen = gain > 0 && behind && Math.abs(heroPoint.z) < 1 && Math.abs(heroPoint.x) < 1.4 && Math.abs(heroPoint.y) < 1.4;
+    // The caustic and the flash belong to the edge passing over the source.
+    // Both are weighted by how steeply the source's path crosses the nearest
+    // edge, so a source that slides along a nearly level crest or lower edge
+    // (in the wide views) stays a bright star instead of a glowing ball that
+    // rides the edge for a second. A pure function of the current pose and
+    // travelled distance, so a paused frame stays bit-identical.
+    let flash = 0, crossing = 0, weight = 0;
+    if (onScreen) {
+      if (!projected) { projectSilhouette(); projected = true; }
+      const px = heroPoint.x * .5 * aspect, py = heroPoint.y * .5;
+      const distance = silhouetteDistance(px, py);
+      const vx = (heroAhead.x - heroPoint.x) * .5 * aspect, vy = (heroAhead.y - heroPoint.y) * .5;
+      const v = Math.hypot(vx, vy);
+      crossing = v > 1e-9 ? Math.abs(vx * closest.ty - vy * closest.tx) / v : 0;
+      weight = THREE.MathUtils.smoothstep(crossing, HERO_CROSSING[0], HERO_CROSSING[1]);
+      // The source itself flares as the edge passes over it: brief, and only
+      // within a few dozen pixels of the silhouette.
+      flash = gain * brightness * weight * HERO_FLASH * Math.exp(-((distance / HERO_FLASH_WIDTH) ** 2));
+    }
+    caustics[i].set(heroPoint.x * .5 + .5, heroPoint.y * .5 + .5, onScreen ? gain * brightness * weight * HERO_CAUSTIC : 0, HERO_RADIUS);
+    heroFlash.flashes[i].set(heroPoint.x * .5 + .5, heroPoint.y * .5 + .5, flash > .002 ? flash : 0, 0);
+    flashing ||= flash > .002;
+    const readout = heroReadout[i];
+    readout.x = heroPoint.x * .5 + .5; readout.y = .5 - heroPoint.y * .5;
+    readout.flash = flash > .002 ? flash : 0; readout.crossing = crossing; readout.onScreen = onScreen;
+  }
+  heroFlash.enabled = flashing;
 }
 
 function init() {
@@ -182,6 +320,7 @@ function init() {
   const fill = new THREE.DirectionalLight(0x1670c7, 1.5); fill.position.set(2, -3, -4); shipScene.add(fill);
   ship = createShip(); shipScene.add(ship);
   makeStars();
+  makeHeroes();
 
   // A small live probe gathers light from the whole surrounding space, not
   // only the part currently visible behind the optical bands.
@@ -206,7 +345,9 @@ function init() {
     lightUniforms.uCameraMatrix.value.copy(faceCamera.matrixWorld);
     lightUniforms.uCameraPosition.value.setFromMatrixPosition(faceCamera.matrixWorld);
   };
-  lightScene.add(starMesh.clone(), farStars.clone());
+  const lightHeroes = heroMesh.clone();
+  heroCopies.push(lightHeroes);
+  lightScene.add(starMesh.clone(), farStars.clone(), lightHeroes);
   offscreenTarget = new THREE.WebGLCubeRenderTarget(256, {
     type: THREE.HalfFloatType, minFilter: THREE.LinearMipmapLinearFilter,
     magFilter: THREE.LinearFilter, generateMipmaps: true, depthBuffer: false,
@@ -233,7 +374,8 @@ function init() {
     uProfile: { value: field.texture },
     uProfileSlope: { value: field.derivativeTexture },
     uLensing: { value: state.lensing }, uProjection: { value: camera.projectionMatrix },
-  }, { STEPS: quality[state.quality].steps });
+    uHeroCaustic: { value: HEROES.map(() => new THREE.Vector4()) },
+  }, { STEPS: quality[state.quality].steps, HERO_COUNT: HEROES.length });
   composite = volume.scene; volumeMaterial = volume.material;
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(composite, new THREE.Camera()));
@@ -241,9 +383,20 @@ function init() {
   composer.addPass(shipPass);
   const foregroundPass = new RenderPass(foreground, camera); foregroundPass.clear = false;
   composer.addPass(foregroundPass);
+  // Lens: a hero source's flash is added to the HDR frame first, so that the
+  // anamorphic streak (taken before the round bloom and added back in the lens
+  // pass) and the round bloom both spread it like any other highlight.
+  heroFlash = new HeroFlashPass(HEROES.length);
+  composer.addPass(heroFlash);
+  streak = new StreakBloomPass();
+  composer.addPass(streak);
   bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), state.bloom, .72, .42);
   composer.addPass(bloom);
-  lens = new ShaderPass({ uniforms: { tDiffuse: { value: null }, uTime: shared.uTime, uResolution: shared.uResolution, uBloom: { value: state.bloom } }, vertexShader: fullscreenVertex, fragmentShader: lensFragment });
+  lens = new ShaderPass({ uniforms: {
+    tDiffuse: { value: null }, uTime: shared.uTime, uResolution: shared.uResolution, uBloom: { value: state.bloom },
+    tStreak: { value: null }, uStreak: { value: 0 }, uOldFlare: { value: 1 }, uStreakTexel: { value: new THREE.Vector2(1, 1) },
+    uVignette: { value: 0 }, uLetterbox: { value: 0 }, uBlackLevel: { value: 0 },
+  }, vertexShader: fullscreenVertex, fragmentShader: lensFragment });
   // Full-screen passes must not inherit stale depth from the ship pass when
   // EffectComposer alternates its buffers. That caused alternating/feedback
   // frames in the earlier renderer.
@@ -252,6 +405,14 @@ function init() {
   const output = new OutputPass(); output.material.depthTest = false; output.material.depthWrite = false;
   composer.addPass(output);
   fxaa = new ShaderPass(FXAAShader); fxaa.material.depthTest = false; fxaa.material.depthWrite = false; composer.addPass(fxaa);
+  // Film finish, last so FXAA cannot smear its grain (see src/film.js).
+  film = new FilmPass({
+    uNoise: shared.uNoise, uResolution: shared.uResolution, uProfile: { value: field.texture },
+    uInverseProjection: { value: camera.projectionMatrixInverse }, uCameraMatrix: { value: camera.matrixWorld }, uCameraPosition: { value: camera.position },
+    uGrain: { value: 0 }, uSoftness: { value: 0 }, uFocus: { value: 0 }, uDust: { value: 0 }, uGrade: { value: 0 }, uLetterbox: { value: 0 },
+    uFrame: { value: 0 }, uFocusNear: { value: 0 }, uDustNear: { value: 0 }, uDustPhase: { value: new THREE.Vector4() }, uDustFlow: { value: new THREE.Vector2() },
+  });
+  composer.addPass(film);
 
   $('quality').value = state.quality;
   updateAppearanceButtons();
@@ -269,6 +430,7 @@ function init() {
   window.warp = {
     get state() { return { ...state, fps, simulationTime: fluid.time }; },
     get fieldShape() { return field.lobes.map(lobe => ({ ...lobe })); },
+    get heroes() { return heroReadout.map(hero => ({ ...hero })); },
     get reference() { return { ...reference, duration: REFERENCE_DURATION, audioTime: referenceAudio.currentTime, audioPaused: referenceAudio.paused, camera: camera.position.toArray(), target: cameraTarget.toArray() }; },
     get flyby() { return { ...flyby, duration: FLYBY_DURATION, camera: camera.position.toArray(), target: cameraTarget.toArray() }; },
     setView,
@@ -647,6 +809,29 @@ function render(dt) {
   farStars.geometry.setDrawRange(0, Math.round(FAR_STAR_COUNT*state.stars));
   bloom.strength = state.bloom;
   lens.uniforms.uBloom.value = state.bloom;
+  // Streak bloom fades out as its length goes to 0; the old five-tap flare
+  // only comes back as the streak goes away, so the two never double up.
+  const streakAmount = effectValue('streak') * THREE.MathUtils.smoothstep(effectValue('streakLength'), 0, .2);
+  streak.enabled = streakAmount > 0 && state.bloom > 0;
+  streak.stretch = Math.min(.95, .5 + .42 * effectValue('streakLength'));
+  const tint = effectValue('streakTint');
+  streak.tint.setRGB(1 - .30 * tint, 1 - .12 * tint, 1 + .12 * tint);
+  // ShaderPass clones its uniforms, so the streak's texture and texel size
+  // (both replaced on resize) are copied in every frame.
+  lens.uniforms.tStreak.value = streak.texture;
+  lens.uniforms.uStreakTexel.value.copy(streak.texel);
+  lens.uniforms.uStreak.value = streak.enabled ? streakAmount * state.bloom / .65 * STREAK_GAIN : 0;
+  lens.uniforms.uOldFlare.value = Math.max(0, 1 - streakAmount * 4);
+  starUniforms.uStarStreak.value = effectValue('starStreaks');
+  // Star streaks switch a shader define, so 0% runs the original star shaders.
+  if ((starUniforms.uStarStreak.value > 0) !== starStreaksOn) {
+    starStreaksOn = !starStreaksOn;
+    for (const material of starMaterials) {
+      if (starStreaksOn) material.defines.STAR_STREAKS = ''; else delete material.defines.STAR_STREAKS;
+      material.needsUpdate = true;
+    }
+  }
+  updateHeroes();
   volumeMaterial.uniforms.uTurbulence.value = state.turbulence;
   volumeMaterial.uniforms.uIntensity.value = state.intensity;
   volumeMaterial.uniforms.uBloom.value = state.bloom;
@@ -657,10 +842,11 @@ function render(dt) {
   volumeMaterial.uniforms.uLensing.value = state.lensing;
   volumeMaterial.uniforms.uEntrance.value = THREE.MathUtils.smoothstep(state.entrance, 0, 1);
   lens.uniforms.uTime.value = state.time;
+  updateFilm();
   ship.visible = state.ship && state.view !== 'ride';
   ship.rotation.x = Math.sin(state.time * .28) * .028;
   ship.rotation.z = Math.sin(state.time * .21) * .012;
-  const spaceKey = ['nebula', 'nebulaDensity', 'nebulaGlow'].map(effectValue).join('/');
+  const spaceKey = ['nebula', 'nebulaDensity', 'nebulaGlow', 'heroFlares', 'starStreaks'].map(effectValue).join('/');
   if (state.appearance === 'glow') {
     const nextLightKey = `${state.travel}/${state.speed}/${state.stars}/${state.bloom}/${spaceKey}`;
     if (nextLightKey !== lightKey) {
@@ -679,6 +865,39 @@ function render(dt) {
   renderer.clearDepth(); renderer.render(world, sceneCamera);
   renderer.setRenderTarget(null);
   composer.render();
+}
+
+// Speed dust drifts at a fixed fraction of the travelled distance: near, mid
+// and far layers, then the veil. Wrapped to the noise lattice's 64-cell period.
+const DUST_RATES = [.0075, .0062, .0048, .0012];
+const FILM_CONTROLS = [['grain', 'uGrain'], ['softness', 'uSoftness'], ['focus', 'uFocus'], ['dust', 'uDust'], ['grade', 'uGrade']];
+function updateFilm() {
+  const u = film.uniforms;
+  for (let i = 0; i < FILM_CONTROLS.length; i++) u[FILM_CONTROLS[i][1]].value = effectValue(FILM_CONTROLS[i][0]);
+  // A 2.39:1 letterbox during the camera sequences, on screens wider than
+  // tall; on a portrait phone it would leave only a thin strip.
+  const aspect = innerWidth / innerHeight;
+  const sequence = state.view === 'reference' || state.view === 'flyby';
+  const bar = Math.max(0, (1 - aspect/2.39)/2);
+  u.uLetterbox.value = effectValue('letterbox') && sequence && aspect >= 1.2 && bar*innerHeight >= 1 ? bar : 0;
+  // The vignette is optical, so the lens pass applies it (once), following
+  // the letterboxed picture.
+  lens.uniforms.uVignette.value = effectValue('vignette');
+  lens.uniforms.uBlackLevel.value = effectValue('blackLevel');
+  lens.uniforms.uLetterbox.value = u.uLetterbox.value;
+  // Grain changes once per simulation frame and is frozen while paused.
+  u.uFrame.value = Math.floor(state.time*60 + .5) % 65536;
+  // Depth of field and the near dust both follow how close the camera is to
+  // the field: strong in the bow close-up, almost gone in the wide shot.
+  const p = camera.position, x = THREE.MathUtils.clamp(p.x, 0, FIELD_LENGTH);
+  const distance = Math.hypot(p.x - x, p.y, p.z);
+  u.uFocusNear.value = 1/(1 + (distance/45)**2);
+  u.uDustNear.value = 1/(1 + (distance/35)**2);
+  for (let i = 0; i < 4; i++) u.uDustPhase.value.setComponent(i, (state.travel*DUST_RATES[i]) % 64);
+  // The on-screen direction space streams past: camera right/up against +x.
+  u.uDustFlow.value.set(camera.matrixWorld.elements[0], camera.matrixWorld.elements[4]);
+  film.enabled = u.uGrain.value > 0 || u.uSoftness.value > 0 || u.uFocus.value > 0 || u.uDust.value > 0
+    || u.uGrade.value > 0 || u.uLetterbox.value > 0;
 }
 
 function tick(now) {
