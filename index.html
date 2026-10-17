@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#03090b" />
+    <meta name="description" content="A real-time, volumetric warp field inspired by Star Trek Beyond." />
+    <title>Beyond — Warp field study</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M28 5Q-15 16 28 27Q-2 16 28 5' fill='%239addeb'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <main id="app">
+      <canvas id="scene" aria-label="Animated 3D warp bubble with a starship and streaming blue plasma"></canvas>
+      <div class="frame top-frame"></div><div class="frame bottom-frame"></div>
+      <header class="interface masthead">
+        <div class="identity"><span class="insignia" aria-hidden="true"></span><div><h1>BEYOND</h1><p>Warp field study</p></div></div>
+        <div class="top-actions"><a href="https://www.youtube.com/watch?v=gCCYWTAA2wQ" target="_blank" rel="noreferrer">Reference <span aria-hidden="true">↗</span></a><button id="fullscreen" title="Fullscreen (F)" aria-label="Fullscreen">⛶</button></div>
+      </header>
+      <div class="interface scene-caption"><span class="live-dot"></span><span id="view-label">EXTERIOR / TRACKING</span><span class="caption-rule"></span><span id="motion-label">FIELD ACTIVE</span></div>
+      <section class="interface controls" aria-label="Warp controls">
+        <div class="transport">
+          <button class="play-button" id="play" aria-label="Pause animation" title="Pause (Space)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6v12M16 6v12"/></svg></button>
+          <button class="replay-button" id="replay" title="Restart (R)" aria-label="Restart animation">↺</button>
+        </div>
+        <div class="view-control"><span class="control-label">Camera</span><div class="segmented" aria-label="Camera view"><button data-view="tracking" aria-pressed="true">Tracking</button><button data-view="bow" aria-pressed="false">Bow</button><button data-view="orbit" aria-pressed="false">Orbit</button><button data-view="ride" aria-pressed="false">On board</button></div></div>
+        <label class="slider-control"><span class="control-label">Warp speed <output for="speed" id="speed-value">8.0</output></span><input id="speed" type="range" min="1" max="10" step="0.1" value="8" /></label>
+        <label class="slider-control"><span class="control-label">Turbulence <output for="turbulence" id="turbulence-value">65%</output></span><input id="turbulence" type="range" min="0" max="1.5" step="0.01" value="0.65" /></label>
+        <label class="slider-control"><span class="control-label">Field intensity <output for="intensity" id="intensity-value">100%</output></span><input id="intensity" type="range" min="0" max="2" step="0.01" value="1" /></label>
+        <label class="slider-control"><span class="control-label">Light bending <output for="lensing" id="lensing-value">70%</output></span><input id="lensing" type="range" min="0" max="2" step="0.01" value="0.7" /></label>
+        <div class="extra-control"><label class="check-label"><input type="checkbox" id="ship" checked /> Show ship</label><select id="quality" aria-label="Render quality"><option value="balanced">Balanced quality</option><option value="high">High quality</option><option value="low">Low quality</option></select></div>
+      </section>
+      <footer class="interface footer"><span id="hint">Drag to look around in orbit view</span><div><button id="capture">Save frame</button><span class="separator">/</span><button id="hide">Hide controls <kbd>H</kbd></button></div></footer>
+      <button id="show" class="show-controls" hidden>Show controls <kbd>H</kbd></button>
+      <div id="loading" class="loading"><span class="loading-ring"></span><p>Forming warp field</p></div>
+      <div id="error" class="error" hidden><h2>The warp field couldn’t start.</h2><p id="error-message"></p><button onclick="location.reload()">Try again</button></div>
+      <div id="notice" role="status"></div>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
