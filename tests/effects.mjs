@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 
 const SLIDERS = ['nebula', 'nebulaDensity', 'nebulaGlow', 'blackLevel', 'interior', 'interiorShrink', 'crestThickness', 'crestLight', 'crestVariation',
+  'gas', 'gasShock', 'gasPileup', 'gasDepth', 'gasFlow',
   'streak', 'streakLength', 'streakTint', 'heroFlares', 'starStreaks',
   'grain', 'softness', 'focus', 'dust', 'grade', 'vignette'];
+// Experiments (checkboxes that are on by default).
+const TOGGLES = ['energyRim', 'gasReacts'];
 
 // The Effects panel: every control changes the picture, survives appearance
 // switches and replays, can be set from the URL, and stays deterministic.
@@ -38,13 +41,15 @@ export async function checkEffects(browser, url) {
       assert.notEqual(await hash(), defaults, `${id} at 0 did not change the frame`);
       await setRange(id, original);
     }
-    await page.locator('#energyRim').uncheck();
-    assert.notEqual(await hash(), defaults, 'Energy-conserving rim toggle did not change the frame');
-    await page.locator('#energyRim').check();
+    for (const id of TOGGLES) {
+      await page.locator(`#${id}`).uncheck();
+      assert.notEqual(await hash(), defaults, `${id} toggle did not change the frame`);
+      await page.locator(`#${id}`).check();
+    }
     assert.equal(await hash(), defaults, 'Restoring every effect did not restore the frame');
 
     for (const id of SLIDERS) await setRange(id, 0);
-    await page.locator('#energyRim').uncheck();
+    for (const id of TOGGLES) await page.locator(`#${id}`).uncheck();
     const off = await hash();
     assert.equal(await hash(), off, 'All-off frame is not stable while paused');
 
@@ -59,7 +64,7 @@ export async function checkEffects(browser, url) {
     await page.locator('#effects-off').click();
     assert.equal(await hash(), off, 'All off did not zero every effect');
     for (const id of SLIDERS) assert.equal(Number(await page.locator(`#${id}`).inputValue()), 0, `All off left ${id} on`);
-    assert.equal(await page.locator('#energyRim').isChecked(), false, 'All off left the experiment on');
+    for (const id of TOGGLES) assert.equal(await page.locator(`#${id}`).isChecked(), false, `All off left the ${id} experiment on`);
     assert.equal(await page.locator('#letterbox').isChecked(), false, 'All off left the letterbox on');
     await setRange('crestThickness', 1.4);
     for (const appearance of ['fluid', 'space', 'glow']) await page.locator(`[data-appearance="${appearance}"]`).click();
@@ -95,6 +100,120 @@ export async function checkEffects(browser, url) {
     await page.close();
   }
   await checkFilm(browser, url);
+  await checkGas(browser, url);
+}
+
+// The gas reacts to the field: it piles up against the outside of the lower
+// surface, the dark interiors stay dark, the reaction is still while paused,
+// switching it off (the experiment, or Gas interaction at 0%) gives back
+// exactly the frame of the gas that ignores the field, and it streams
+// downstream only (to the right in the wide view), never toward the bow.
+async function checkGas(browser, url) {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 536 } });
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
+  const setRange = (id, value) => page.locator(`#${id}`).evaluate((el, v) => {
+    el.value = v; el.dispatchEvent(new Event('input', { bubbles: true }));
+  }, String(value));
+  // Hash and mean luminance of boxes (top-down fractions of the frame): the
+  // gas just under the lower surface and the lower interior of the field.
+  const frame = () => page.evaluate(() => {
+    window.warp.render();
+    const gl = document.querySelector('canvas').getContext('webgl2');
+    const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let hash = 2166136261;
+    for (let i = 0; i < px.length; i += 16) hash = Math.imul(hash ^ px[i] ^ (px[i + 1] << 8) ^ (px[i + 2] << 16), 16777619);
+    const mean = (x0, x1, y0, y1) => {
+      let sum = 0, n = 0;
+      for (let y = Math.round(y0 * h); y < Math.round(y1 * h); y++) for (let x = Math.round(x0 * w); x < Math.round(x1 * w); x++) {
+        const i = ((h - 1 - y) * w + x) * 4; sum += .2126 * px[i] + .7152 * px[i + 1] + .0722 * px[i + 2]; n++;
+      }
+      return sum / n;
+    };
+    return { hash: hash >>> 0, below: mean(.25, .45, .74, .82), interior: mean(.30, .50, .55, .63) };
+  });
+  try {
+    await page.goto(`${url}/?paused&time=10`);
+    await page.waitForFunction(() => window.warp && document.getElementById('loading').hidden);
+    await page.locator('#effects summary').click();
+    const reacting = await frame();
+    for (let i = 0; i < 3; i++) assert.equal((await frame()).hash, reacting.hash, 'The gas reaction flickers while paused');
+    await page.locator('#gasReacts').uncheck();
+    const ignoring = await frame();
+    await page.locator('#gasReacts').check();
+    await setRange('gas', 0);
+    assert.equal((await frame()).hash, ignoring.hash, 'Gas interaction at 0% is not the same as the experiment off');
+    await setRange('gas', 1);
+    assert.equal((await frame()).hash, reacting.hash, 'Gas interaction did not restore the reaction exactly');
+    assert(reacting.below > ignoring.below + 15, `The gas does not pile up under the field (${ignoring.below.toFixed(1)} -> ${reacting.below.toFixed(1)})`);
+    assert(reacting.interior < ignoring.interior + 6 && reacting.interior < reacting.below * .3,
+      `The gas fills the dark interior (${ignoring.interior.toFixed(1)} -> ${reacting.interior.toFixed(1)})`);
+    // Nothing drifts toward the bow: the gas's own light (on minus off) must
+    // move to the right (downstream) as the field travels on, in a band below
+    // the field and one above it. Every seek past 10 s leaves the fluid in the
+    // same state, so only the travelled distance differs between the frames:
+    // 1, 2 and 4 units on. The column profiles are high-passed so the broad
+    // brightening does not decide the match, only the strands and lumps that
+    // move. The search window is a few times the expected shift (2–3 px per
+    // unit here), so the match is unambiguous, and the shift must be positive
+    // and grow with the distance. This guards the lag and the deflection
+    // against future tuning.
+    const shifts = await page.evaluate(() => {
+      const gl = document.querySelector('canvas').getContext('webgl2');
+      const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+      const read = () => { window.warp.render(); const px = new Uint8Array(w * h * 4); gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px); return px; };
+      const react = on => { const el = document.getElementById('gasReacts'); el.checked = on; el.dispatchEvent(new Event('change')); };
+      const columns = (a, b, y0, y1) => {
+        const col = new Float64Array(w);
+        for (let y = Math.round(y0 * h); y < Math.round(y1 * h); y++) for (let x = 0; x < w; x++) {
+          const i = ((h - 1 - y) * w + x) * 4; col[x] += a[i] + a[i + 1] + a[i + 2] - b[i] - b[i + 1] - b[i + 2];
+        }
+        const out = new Float64Array(w);
+        for (let x = 0; x < w; x++) {
+          let sum = 0, n = 0;
+          for (let k = Math.max(0, x - 30); k <= Math.min(w - 1, x + 30); k++) { sum += col[k]; n++; }
+          out[x] = col[x] - sum / n;
+        }
+        return out;
+      };
+      window.warp.seek(10);
+      const velocity = window.warp.state.travel / 10, start = 10 * velocity + .3;
+      const bands = [[.74, .97], [.05, .30]];
+      const at = travel => {
+        window.warp.seek(travel / velocity);
+        react(true); const on = read();
+        react(false); const off = read();
+        react(true);
+        return bands.map(([y0, y1]) => columns(on, off, y0, y1));
+      };
+      const before = at(start);
+      const result = bands.map(() => []);
+      for (const distance of [1, 2, 4]) {
+        const after = at(start + distance);
+        const reach = 6 * distance + 2;
+        bands.forEach((band, b) => {
+          let best = -Infinity, shift = 0;
+          for (let s = -reach; s <= reach; s++) {
+            let score = 0;
+            for (let x = 100; x < w - 100; x++) score += before[b][x] * after[b][x + s];
+            if (score > best) { best = score; shift = s; }
+          }
+          result[b].push(shift);
+        });
+      }
+      window.warp.seek(10);
+      return result;
+    });
+    ['below', 'above'].forEach((band, b) => assert(shifts[b].every(s => s > 0) && shifts[b][2] > shifts[b][0],
+      `The gas ${band} the field does not stream downstream (best matches ${shifts[b].join(', ')} px for 1, 2 and 4 units)`));
+    assert.deepEqual(errors, []);
+    console.log(`PASS: the gas piles up under the field (${ignoring.below.toFixed(0)} -> ${reacting.below.toFixed(0)}), the interior stays dark (${ignoring.interior.toFixed(0)} -> ${reacting.interior.toFixed(0)}), still while paused, off restores the frame exactly, and it streams downstream (${shifts[0].join('/')} px below, ${shifts[1].join('/')} px above for 1/2/4 units)`);
+  } finally {
+    await page.close();
+  }
 }
 
 // The film finish: a 2.39:1 letterbox only during the camera sequences on a
@@ -160,7 +279,7 @@ async function checkFilm(browser, url) {
 // The opened panel must fit on short and landscape phones: every control can
 // be scrolled to inside the panel, and then lies fully inside the viewport.
 export async function checkEffectsLayout(browser, url) {
-  const ids = [...SLIDERS, 'energyRim', 'letterbox', 'effectsBypass', 'effects-reset', 'effects-off'];
+  const ids = [...SLIDERS, ...TOGGLES, 'letterbox', 'effectsBypass', 'effects-reset', 'effects-off'];
   for (const [width, height] of [[390, 844], [375, 667], [844, 390], [1280, 536]]) {
     const context = await browser.newContext({ viewport: { width, height }, isMobile: width < 700, hasTouch: width < 700 });
     const page = await context.newPage();

@@ -10,6 +10,7 @@ import { fullscreenVertex, backgroundFragment, starVertex, starFragment, heroVer
 import { StreakBloomPass, HeroFlashPass } from './streak.js';
 import { createShip } from './ship.js';
 import { FilmPass } from './film.js';
+import { GasFlow } from './gasflow.js';
 import { ShellFluid } from './fluid.js';
 import { WarpField, FIELD_LENGTH } from './field.js';
 import { REFERENCE_DURATION, referenceCameraAt } from './reference-sequence.js';
@@ -44,6 +45,7 @@ const EFFECTS = {
   nebula: 1, nebulaDensity: 1, nebulaGlow: 1, blackLevel: 1,
   interior: .92, interiorShrink: .6, crestThickness: 1, crestLight: .85, crestVariation: 1,
   energyRim: true,
+  gas: 1, gasShock: 1, gasPileup: 1, gasDepth: 1, gasFlow: 1, gasReacts: true,
   streak: 1, streakLength: .75, streakTint: .8, heroFlares: 1, starStreaks: 1,
   grain: 1, softness: 1, focus: 1, dust: 1, grade: 1, vignette: 1, letterbox: true,
 };
@@ -70,6 +72,10 @@ let streak, heroFlash, heroUniforms, heroMesh, starStreaksOn = false;
 const starMaterials = [], heroCopies = [];
 let lightTarget, lightCamera, lightScene, lightKey = '';
 let film;
+// The gas that reacts to the field: its flow table, and every material whose
+// shader switches GAS_FIELD (so with the gas off they are the original ones).
+let gasFlow, gasOn = false;
+const gasMaterials = [];
 let sceneCamera, offscreenTarget, offscreenCamera, offscreenKey = '';
 const SCENE_OVERSCAN = 1.8;
 const STAR_COUNT = 7200, FAR_STAR_COUNT = 1200;
@@ -304,14 +310,20 @@ function init() {
     uInteriorDarkness: { value: state.interior }, uInteriorShrink: { value: state.interiorShrink },
     uCrestThickness: { value: state.crestThickness }, uCrestLight: { value: state.crestLight },
     uCrestVariation: { value: state.crestVariation }, uEnergyRim: { value: state.energyRim ? 1 : 0 },
+    uGasFlow: { value: null }, uGasBody: { value: null }, uGasTail: { value: new THREE.Vector2(270, FIELD_LENGTH) }, uGas: { value: new THREE.Vector4() }, uGasDepth: { value: 1 },
   };
   field = new WarpField(shared.uNoise.value);
+  gasFlow = new GasFlow(shared.uNoise.value);
+  shared.uGasFlow.value = gasFlow.texture;
+  shared.uGasBody.value = field.texture;
   fluid = new ShellFluid(renderer, shared.uNoise.value);
   // Begin with a developed velocity field rather than a frozen noise pattern.
   for (let i=0; i<90; i++) fluid.update(1/60, state.speed, state.turbulence);
-  background = makeFullscreenScene(backgroundFragment, {
+  const backdrop = makeFullscreenScene(backgroundFragment, {
     ...shared, uInverseProjection: { value: sceneCamera.projectionMatrixInverse },
-  }).scene;
+  });
+  background = backdrop.scene;
+  gasMaterials.push(backdrop.material);
   world = new THREE.Scene();
   foreground = new THREE.Scene();
   shipScene = new THREE.Scene();
@@ -336,8 +348,11 @@ function init() {
     uInverseProjection: { value: new THREE.Matrix4() },
     uCameraMatrix: { value: new THREE.Matrix4() },
     uCameraPosition: { value: new THREE.Vector3() },
+    uGasFlow: shared.uGasFlow, uGasBody: shared.uGasBody, uGasTail: shared.uGasTail, uGas: shared.uGas,
   };
-  lightScene = makeFullscreenScene(backgroundFragment, lightUniforms).scene;
+  const lightSkyScene = makeFullscreenScene(backgroundFragment, lightUniforms);
+  lightScene = lightSkyScene.scene;
+  gasMaterials.push(lightSkyScene.material);
   const lightSky = lightScene.children[0];
   lightSky.renderOrder = -1;
   lightSky.onBeforeRender = (_renderer, _scene, faceCamera) => {
@@ -377,6 +392,7 @@ function init() {
     uHeroCaustic: { value: HEROES.map(() => new THREE.Vector4()) },
   }, { STEPS: quality[state.quality].steps, HERO_COUNT: HEROES.length });
   composite = volume.scene; volumeMaterial = volume.material;
+  gasMaterials.push(volumeMaterial);
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(composite, new THREE.Camera()));
   const shipPass = new RenderPass(shipScene, camera); shipPass.clear = false; shipPass.clearDepth = true;
@@ -802,6 +818,7 @@ function render(dt) {
   field.update(state.travel);
   volumeMaterial.uniforms.uTailFade.value.set(field.tail.start,field.tail.end);
   volumeMaterial.uniforms.uTailCap.value.set(field.tail.center,field.tail.end,field.tail.upper,field.tail.lower);
+  updateGas();
   starUniforms.uTravel.value = state.travel;
   starUniforms.uVelocity.value = spaceVelocity();
   starUniforms.uBloom.value = state.bloom;
@@ -846,7 +863,7 @@ function render(dt) {
   ship.visible = state.ship && state.view !== 'ride';
   ship.rotation.x = Math.sin(state.time * .28) * .028;
   ship.rotation.z = Math.sin(state.time * .21) * .012;
-  const spaceKey = ['nebula', 'nebulaDensity', 'nebulaGlow', 'heroFlares', 'starStreaks'].map(effectValue).join('/');
+  const spaceKey = ['nebula', 'nebulaDensity', 'nebulaGlow', 'heroFlares', 'starStreaks'].map(effectValue).join('/') + `/${shared.uGas.value.toArray()}`;
   if (state.appearance === 'glow') {
     const nextLightKey = `${state.travel}/${state.speed}/${state.stars}/${state.bloom}/${spaceKey}`;
     if (nextLightKey !== lightKey) {
@@ -865,6 +882,26 @@ function render(dt) {
   renderer.clearDepth(); renderer.render(world, sceneCamera);
   renderer.setRenderTarget(null);
   composer.render();
+}
+
+// The gas reacts to the field (Effects › Gas). Off (the experiment toggle, or
+// Gas interaction at 0%) removes GAS_FIELD from the shaders, so they are
+// exactly the earlier ones. The interaction fades in with the field.
+function updateGas() {
+  const on = effectValue('gasReacts') && effectValue('gas') > 0;
+  if (on !== gasOn) {
+    gasOn = on;
+    for (const material of gasMaterials) {
+      if (on) material.defines.GAS_FIELD = ''; else delete material.defines.GAS_FIELD;
+      material.needsUpdate = true;
+    }
+  }
+  if (!on) { shared.uGas.value.set(0, 0, 0, 0); return; }
+  const strength = effectValue('gas') * THREE.MathUtils.smoothstep(state.entrance, 0, 1);
+  shared.uGas.value.set(strength, effectValue('gasShock'), strength * effectValue('gasPileup'), strength * effectValue('gasFlow'));
+  shared.uGasDepth.value = effectValue('gasDepth');
+  shared.uGasTail.value.set(field.tail.start, field.tail.end);
+  gasFlow.update(renderer, state.travel);
 }
 
 // Speed dust drifts at a fixed fraction of the travelled distance: near, mid

@@ -221,8 +221,11 @@ void main() {
 // warping fold the fbm into banks, wisps and dark dust lanes; it is fixed in
 // the passing world (only travelled distance moves it) and denser below the
 // field. Nebula brightness/density at zero leave only the original faint fog.
-const nebula = /* glsl */`
-uniform float uNebula, uNebulaDensity, uNebulaGlow;
+// The volume shaders declare the first two uniforms themselves, so the gas
+// that reacts to the field (gasNearField below) includes only the function.
+const nebulaUniforms = /* glsl */`
+uniform float uNebula, uNebulaDensity, uNebulaGlow;`;
+const nebulaFunction = /* glsl */`
 // rgb: emitted colour, a: density. 'hot' marks sparse emissive cores.
 vec4 nebulaAt(vec3 world, float horizon, out float hot) {
   vec3 p=vec3((world.x-uTravel)*.0135,world.y*.0175,world.z*.0145)+vec3(41.0,13.0,7.0);
@@ -280,6 +283,398 @@ vec4 nebulaAt(vec3 world, float horizon, out float hot) {
   return vec4(color,density);
 }
 `;
+const nebula = nebulaUniforms + nebulaFunction;
+
+// The gas reacts to the field (Effects › Gas). The field moves through the
+// nebula like a body through a stream: the gas is deflected around it, never
+// through it. Seen from the field, that is a steady potential flow, so where
+// the gas at any point came from is a pure function of the field's shape;
+// nothing is simulated or accumulated, every frame stands on its own, and the
+// gas only ever streams downstream (+x, the way the passing world moves).
+//
+// Slender-body theory: a line of sources along the axis, of strength U·dA/dx,
+// carries the uniform stream around a body of revolution with cross-section
+// A(x). Its stream function gives the radius r0 a streamline had far upstream
+// as r0² = r² − Ā(x, r)/π, where Ā is A smoothed along the axis by the kernel
+// ½r²/(s²+r²)^1.5 (as wide as the distance from the axis: the body's bumps
+// are felt close to it and blur out farther away). Its velocity potential
+// gives how far the gas lags behind the undisturbed stream (slowed ahead of
+// the nose, sped up along the flanks). Both integrals are taken here, once
+// per field shape, into a small 2D table indexed by x and the distance from
+// the axis; the gas lookups read it with one bilinear tap.
+// x from GAS_X0 over GAS_XSPAN, r = GAS_RMAX·v² (finer near the axis).
+const gasFlowTable = /* glsl */`
+const float GAS_X0=-96.0, GAS_XSPAN=576.0, GAS_RMAX=256.0;`;
+export const gasFlowFragment = /* glsl */`
+${gasFlowTable}
+uniform sampler2D uProfile;
+uniform vec2 uTailFade;
+varying vec2 vUv;
+const float LENGTH=390.0;
+// Cross-section of the field in its round (normalised) coordinates: the
+// half-width squared, so A/π. The last bubble fades out with the field.
+float area(float x) {
+  if (x<=0.0 || x>=LENGTH) return 0.0;
+  if (x<10.0) return 2.7*x;
+  float d=texture2D(uProfile,vec2((x/LENGTH*1023.0+.5)/1024.0,.5)).z;
+  return d*d*(1.0-smoothstep(uTailFade.x,uTailFade.y,x));
+}
+void main() {
+  float x=GAS_X0+GAS_XSPAN*vUv.x;
+  // Rows nearer the axis than this repeat it: closer in, the slender-body
+  // lag sharpens into a spike that the coarse table cannot follow.
+  float r=max(GAS_RMAX*vUv.y*vUv.y,2.0);
+  // Both kernels are sampled through their own cumulative distributions, so
+  // a few dozen taps integrate them at any distance from the axis.
+  float smoothed=0.0, lag=0.0;
+  for (int i=0;i<32;i++) {
+    float u=(float(i)+.5)/32.0;
+    float t=2.0*u-1.0;
+    smoothed+=area(x-r*t/sqrt(1.0-t*t));
+    float s=r*sqrt(1.0/((1.0-u)*(1.0-u))-1.0);
+    lag+=area(x-s)-area(x+s);
+  }
+  // r: the effective radius √(Ā/π); g: the lag (negative: behind the stream).
+  gl_FragColor=vec4(sqrt(smoothed/32.0),lag*.25/(32.0*r),0.0,1.0);
+}`;
+
+// Shared by the backdrop and both volume shaders. uGas: interaction strength,
+// layer thickness, pile-up and deflection (the last two already scaled by the
+// strength). uGasBody is the field profile (upper, lower, half-width).
+const gasFlow = /* glsl */`
+${gasFlowTable}
+uniform sampler2D uGasFlow, uGasBody;
+uniform vec2 uGasTail;
+uniform vec4 uGas;
+const float GAS_LENGTH=390.0;
+// How strongly the lag (slowed at the nose, sped up along the flanks) is shown.
+const float GAS_LAG=2.5;
+float gasTailFade(float x) { return 1.0-smoothstep(uGasTail.x,uGasTail.y,x); }
+// Key light from above, as on the backdrop's banks: the gas on top of the
+// field is lit, the underside of the gas below it less so (never unlit).
+float gasKey(float up) { return .45+.55*smoothstep(-.8,.9,up); }
+struct GasPoint {
+  vec3 look;     // where this gas was in the undisturbed stream
+  float outside; // 0 inside the field (no gas there), 1 outside
+  float surface; // roughly how far outside the field's surface (world units)
+  float radius;  // the field's local half-width
+  float up;      // upward component of the direction from the axis (round coordinates)
+  float stream;  // the radius this streamline had far upstream (constant along it)
+};
+GasPoint gasFlow(vec3 p) {
+  GasPoint g;
+  g.look=p; g.outside=1.0; g.surface=1e4; g.radius=0.0; g.up=p.y/max(length(p.yz),1e-4); g.stream=length(p.yz);
+  // Beyond the table the stream is undisturbed (its edges fade to that, and
+  // the deflection is gone 240 from the axis).
+  if (p.x<GAS_X0 || p.x>GAS_X0+GAS_XSPAN || dot(p.yz,p.yz)>240.0*240.0) return g;
+  vec3 size=p.x<10.0 ? vec3(sqrt(max(2.7*p.x,0.0)))
+    : texture2D(uGasBody,vec2((min(p.x,GAS_LENGTH)/GAS_LENGTH*1023.0+.5)/1024.0,.5)).xyz;
+  float fade=gasTailFade(p.x)*step(0.0,p.x);
+  float depth=max(size.z,.002);
+  float world=length(p.yz);
+  // Round coordinates: the elliptical cross-section becomes a circle near the
+  // field, and space is left round far from it.
+  float scale=mix(max(p.y>=0.0?size.x:size.y,.002)/depth,1.0,smoothstep(1.5*depth,4.0*depth,world));
+  float r=length(vec2(p.y/scale,p.z));
+  g.up=p.y/scale/max(r,1e-4);
+  g.outside=1.0-min(uGas.x,1.0)*sqrt(fade)*(1.0-smoothstep(depth-.6,depth+.6,r));
+  g.surface=p.x<0.0 ? length(p) : world*(1.0-depth/max(r,1e-4));
+  g.radius=depth*sqrt(fade);
+  // Within about a radius of the surface the stream follows the local shape
+  // (into every neck and over every bubble); farther out the table's smoothed
+  // shape takes over. Faded out toward the table's edges.
+  vec4 flow=texture2D(uGasFlow,vec2((p.x-GAS_X0)/GAS_XSPAN,sqrt(min(r,GAS_RMAX)/GAS_RMAX)));
+  float near=1.0-smoothstep(0.0,1.0,(r-depth)/max(depth,1.0));
+  float area=mix(flow.r*flow.r,depth*depth*fade,near*step(0.0,p.x));
+  float edge=smoothstep(GAS_X0,GAS_X0+40.0,p.x)*(1.0-smoothstep(GAS_X0+GAS_XSPAN-40.0,GAS_X0+GAS_XSPAN,p.x))
+    *(1.0-smoothstep(170.0,240.0,r));
+  float deflect=min(.92,uGas.w*.80)*edge;
+  float r0=sqrt(max(r*r-deflect*area,0.0));
+  float ratio=r0/max(r,1e-4);
+  g.stream=r0;
+  g.look=vec3(p.x-uGas.w*GAS_LAG*edge*flow.g,p.y*ratio,p.z*ratio);
+  return g;
+}
+`;
+
+// The gas piled up against the field, sampled near the field itself, so it
+// is truly in 3D: a compressed layer just outside the surface, deepest and
+// densest under the field where the banks press against it, thin at the
+// sides so the dark interiors stay clear, and nothing inside. The volume
+// shaders gather its column along the view ray as they march and light it
+// with the nebula, read where that gas came from upstream. Ahead of the
+// rounded bow, compressed sheets stand off the nose: the bow shock.
+const gasNearField = (declareTravel) => /* glsl */`
+#ifdef GAS_FIELD
+${declareTravel ? 'uniform float uTravel;' : ''}
+uniform float uNebulaGlow, uGasDepth;
+${nebulaFunction}
+${gasFlow}
+// Opacity per unit of column and density, how much brighter compressed gas
+// glows than the bank it came from, and how far upstream the swept-up gas
+// was gathered.
+const float GAS_COLUMN=.22, GAS_GLOW=11.0, GAS_AMBIENT=1.5, GAS_SWEEP=55.0, GAS_SHEET=3.3;
+const vec3 GAS_LUMA=vec3(.2126,.7152,.0722);
+// The ambient luminance range over which the layer's light thins (pressed
+// against a bright bank), and by how much at most; the weight of the broad
+// outer bow-shock sheet and the range over which its clumps fill in.
+const vec3 GAS_BRIGHT=vec3(.03,.09,.6);
+const float GAS_WIDE_WEIGHT=.75;
+const vec2 GAS_WIDE_CLUMPS=vec2(.38,.64);
+// How deep the layer is under the field relative to elsewhere.
+const float GAS_BELOW=.6;
+// The farthest the layer reaches from the surface (three depths under the
+// deepest bubble): the march gathers it only within this distance.
+float gasLayerReach() { return 3.0*uGasDepth*(.40+.11*45.0)*(1.0+GAS_BELOW); }
+// Excess gas (beyond the surrounding nebula) at distance d outside the
+// surface. around: the direction from the axis in round coordinates.
+float gasLayer(float d, vec3 p, float height, vec2 around) {
+  float x=p.x;
+  // Deeper and denser below the bubbles, where the banks are pressed against
+  // them (round the nose the bow shock carries it).
+  float below=smoothstep(.2*height,-.6*height,p.y)*smoothstep(8.0,50.0,x);
+  // About a tenth of the local radius: thin round the slender nose, so it
+  // follows its contour closely, deeper along the big bubbles, and deepest
+  // under them, where the bank pressed against the lower surface is a deep,
+  // lumpy volume rather than a skin.
+  float h=uGasDepth*(.40+.11*height)*(1.0+GAS_BELOW*below);
+  if (d<=0.0 || h<=0.0 || d>=3.0*h || x<-3.0) return 0.0;
+  float pile=smoothstep(0.0,.25*h,d)*exp(-d/h)*(1.0-smoothstep(2.0*h,3.0*h,d));
+  // Thin at the sides facing the camera of the wide shot, so the layer in
+  // front of a bubble hardly veils its dark interior.
+  float sides=mix(1.0,.3,around.y*around.y);
+  // The march only covers the field's box: a very deep layer fades out
+  // before it reaches the sides of the box instead of being cut off there.
+  float box=smoothstep(-3.0,-2.4,x)*(1.0-smoothstep(48.0,64.0,abs(p.y)))*(1.0-smoothstep(52.0,69.0,abs(p.z)));
+  // Round the slender nose the bow shock's sheets carry most of it, and over
+  // the top of the nose and the first flank, where the dark sky above has
+  // little to pile up, it is thinnest: an even skin there read as a glowing
+  // outline of the rim.
+  float top=smoothstep(-.2*height,.6*height,p.y);
+  float nose=mix(.4-.2*top,1.0,smoothstep(4.0,30.0+40.0*top,x));
+  // Thinner over the top all along.
+  float above=top*smoothstep(8.0,50.0,x);
+  return pile*sides*nose*(1.0+1.2*below)*(1.0-.45*above)*gasTailFade(x)*box;
+}
+// The same horizon the backdrop uses for this view ray, so the near gas is
+// denser below the field exactly where the nebula behind it is.
+float gasHorizon(vec3 ray) {
+  vec3 h=uCameraPosition+ray*300.0;
+  vec3 hp=vec3((h.x-uTravel)*.0062,h.y*.006,h.z*.006)+vec3(3.0,29.0,17.0);
+  float rise=(smoothNoise(hp)-.5)*1.5+(smoothNoise(hp*2.7+11.0)-.5)*.6;
+  return ray.y*3.0-.08+clamp(rise,-.55,.30);
+}
+// The light of compressed gas is the light of the space around it, never its
+// own: brighter where the gas it came from is lit (the key light from above)
+// and tinted toward that gas's colour, but black surroundings leave it black.
+// (The hot cores are left to the banks: carried into the layer they made
+// white hotspots against the surface.)
+vec3 gasTint(vec3 cloud, vec3 ambient) {
+  float lit=dot(cloud,GAS_LUMA);
+  float level=dot(ambient,GAS_LUMA);
+  return mix(ambient,level*cloud/max(lit,1e-3),.35)*GAS_AMBIENT*(.7+.6*smoothstep(.02,.5,lit));
+}
+// The gas the layer was gathered from: the nebula read upstream of where the
+// gas at the layer's (column-weighted) centre came from, so it is lit and
+// coloured like the banks the field ploughed through. One lookup per pixel,
+// shared by the layer in front, the layer behind and the bow shock.
+vec4 gasSource=vec4(0.0);
+float gasSourceHot=0.0, gasSourceSet=0.0;
+void gasGather(vec4 front, vec4 back, float horizon) {
+  vec4 acc=front.w>=back.w ? front : back;
+  if (acc.w<.01 || uGas.z<=0.0) return;
+  GasPoint g=gasFlow(acc.xyz/acc.w);
+  gasSource=nebulaAt(g.look-vec3(GAS_SWEEP,0.0,0.0),horizon,gasSourceHot);
+  gasSourceSet=1.0;
+}
+// A framing-steady share of the light around the field (see gasAmbientAt).
+vec3 gasSteadyAmbient=vec3(0.0);
+// Light (rgb) and opacity (a) of one crossing of the layer: acc holds the
+// column-weighted position (xyz) and the column itself (w, world units).
+// It is broken into banks and gaps, and into strands drawn out along the
+// streamlines.
+vec4 gasShell(vec4 acc, vec3 ambient) {
+  if (acc.w<.01 || uGas.z<=0.0) return vec4(0.0);
+  vec3 p=acc.xyz/acc.w;
+  GasPoint g=gasFlow(p);
+  // Strands at fixed distances from the surface, so they run parallel to it
+  // and wrap round the nose in concentric arcs (strands scaled to the local
+  // layer depth fanned out from the nose in straight diagonals), drawn out
+  // along the flow and carried downstream with it.
+  vec2 dir=normalize(p.yz+vec2(1e-4,0.0));
+  vec2 around=dir*(6.0+max(g.surface,0.0)*.55);
+  // (The distance along the flow keeps one fixed scale: dividing the
+  // travelled distance by a size that changes along the field combed it.)
+  float along=g.look.x-uTravel;
+  vec3 q=vec3(along*.060,around)+vec3(9.0,3.0,21.0);
+  float streak=smoothNoise(q)*.62+smoothNoise(q*vec3(1.9,2.2,2.2)+7.0)*.38;
+  float lumps=.15+1.35*smoothstep(.34,.74,streak);
+  // Banks and clear gaps tens of units long, also carried downstream: the
+  // layer breaks into lit stretches instead of following the surface as an
+  // even, glowing outline. Under the field, where the bank is pressed
+  // against the surface, the gaps only thin it and the banks swell into
+  // brighter knots.
+  float gaps=smoothstep(.40,.64,smoothNoise(vec3(along*.022,dir*1.5)+vec3(27.0,41.0,11.0)));
+  float banks=mix(gaps,.45+.75*gaps,smoothstep(.1,-.5,g.up));
+  float column=acc.w*GAS_COLUMN;
+  // Denser where the gas it came from was dense, but never empty: the field
+  // sweeps up gas wherever it goes, so the layer does not come and go with
+  // the banks behind it.
+  float alpha=(1.0-exp(-(.35+.65*min(gasSource.a,1.0))*lumps*banks*uGas.z*column))*nebulaOn();
+  vec3 tint=gasTint(gasSource.rgb,ambient);
+  // Lit from above like the banks: the layer on top of the field takes the
+  // full key light, the underside of the layer below it about half.
+  vec3 light=tint*gasKey(g.up)*uNebula*GAS_GLOW*(.3+.7*lumps)*alpha;
+  // A soft shoulder: a layer pressed against a bright bank must not glare.
+  light/=1.0+dot(light,GAS_LUMA)*6.0;
+  // Over an already bright bank it adds knots and strands (its lumps still
+  // glow, its thin parts hide the bank) rather than an overall lift.
+  light*=1.0-GAS_BRIGHT.z*smoothstep(GAS_BRIGHT.x,GAS_BRIGHT.y,dot(ambient,GAS_LUMA))*(1.0-.6*smoothstep(.6,1.3,lumps));
+  return vec4(light,alpha);
+}
+
+// The bow shock: compressed sheets standing off ahead of the rounded bow and
+// sweeping back round it. Each is the space between two paraboloids
+// r² = k(x + standoff) opening downstream, so the path through it is exact
+// and it is brightest where the view grazes it, as an arc round the nose,
+// even over a void. Strongest at the nose, weakening as it sweeps back, never
+// cutting through the field, and broken into clumps that drift downstream
+// with the gas. Two thin sheets hug the nose (the nested arcs of the Bow
+// view); a third, broad and faint, stands well off it and carries the wide
+// swirl round the nose in the wide shots, where the thin ones lie only a few
+// pixels off the rim. Bow-shock thickness scales their stand-off and depth.
+// The span of a ray inside the paraboloid r² < k(x - x0): an interval of t
+// (empty when x > y).
+vec2 gasParaboloidSpan(vec3 ro, vec3 rd, float k, float x0) {
+  float a=dot(rd.yz,rd.yz), b=2.0*dot(ro.yz,rd.yz)-k*rd.x, c=dot(ro.yz,ro.yz)-k*(ro.x-x0);
+  if (a<1e-6) {
+    if (abs(b)<1e-6) return c<0.0?vec2(-1e6,1e6):vec2(1.0,0.0);
+    return b>0.0?vec2(-1e6,-c/b):vec2(-c/b,1e6);
+  }
+  float disc=b*b-4.0*a*c;
+  if (disc<=0.0) return vec2(1.0,0.0);
+  float root=sqrt(disc);
+  return vec2(-b-root,-b+root)/(2.0*a);
+}
+// The broad outer sheet shows only in the wider framings; in the close-ups it
+// would crowd the bow. A pure function of the camera's distance from the nose.
+float gasWideSheet() { return smoothstep(30.0,80.0,length(uCameraPosition)); }
+const float GAS_WIDE_K=10.0, GAS_WIDE_STANDOFF=10.0, GAS_WIDE_WIDTH=2.5, GAS_SHOCK_END=100.0;
+// The part of the view ray that can meet any sheet: inside the outermost
+// paraboloid, in front of the camera and short of where every sheet has
+// faded out. Empty (x >= y) when the ray misses them all.
+vec2 gasShockBound(vec3 ro, vec3 rd) {
+  if (uGas.y<=0.0) return vec2(1.0,0.0);
+  float grow=.35+.65*uGas.y;
+  // The softer, wider layer of the outermost sheet stands off farthest.
+  vec2 span=gasWideSheet()>0.0 ? gasParaboloidSpan(ro,rd,GAS_WIDE_K,-GAS_WIDE_STANDOFF*grow-.5*GAS_WIDE_WIDTH*uGas.y-.01)
+    : gasParaboloidSpan(ro,rd,2.7*1.55,-2.8*grow-.175*uGas.y-.01);
+  span.x=max(span.x,0.0);
+  if (abs(rd.x)>1e-5) {
+    float t=(GAS_SHOCK_END-ro.x)/rd.x;
+    if (rd.x>0.0) span.y=min(span.y,t); else span.x=max(span.x,t);
+  } else if (ro.x>GAS_SHOCK_END) span=vec2(1.0,0.0);
+  return span;
+}
+// One piece of a sheet, from t=a to t=b: its brightness, by the exact path.
+// Beyond 'behind' (the field's front surface) it is seen through the
+// field's dark interior, which passes 'through' of it.
+float gasShockPiece(vec3 ro, vec3 rd, float a, float b, float sheet, float standoff, float width, float behind, float through) {
+  a=max(a,0.0);
+  if (b<=a) return 0.0;
+  float tm=(a+b)*.5;
+  vec3 m=ro+rd*tm;
+  float rho=length(m.yz);
+  vec3 size=m.x<10.0 ? vec3(sqrt(max(2.7*m.x,0.0)))
+    : texture2D(uGasBody,vec2((min(m.x,GAS_LENGTH)/GAS_LENGTH*1023.0+.5)/1024.0,.5)).xyz;
+  float d=m.x<10.0?(rho*rho-2.7*m.x)/sqrt(4.0*rho*rho+7.29):rho-max(size.x,size.y);
+  bool broad=sheet>1.5;
+  // (Within a few units of the camera, as on board, a sheet is out of focus
+  // and out of the picture, like the layer.)
+  float strength=exp(-max(m.x+standoff,0.0)/(broad ? 18.0 : 7.0+9.0*sheet))*smoothstep(0.0,1.5,d)*(tm>behind?through:1.0)*smoothstep(2.0,8.0,tm);
+  if (strength<.002) return 0.0;
+  // Clumps addressed by the position across the axis too, so the visible
+  // arc breaks up along its length; they drift downstream with the gas. The
+  // broad sheet's clumps are larger.
+  float grain=broad ? .45 : 1.0;
+  vec3 q=vec3((m.x*.09-uTravel*.015+rho*.35)*grain,m.y*.8*grain,m.z*.8*grain+sheet*9.0)+vec3(5.0,9.0,13.0);
+  float clumps=smoothNoise(q)*.55+smoothNoise(q*vec3(2.2,2.7,2.7)+21.0)*.30+smoothNoise(q*vec3(4.1,5.3,5.3)+3.0)*.15;
+  // Seen face-on (over the field) a sheet is a thin veil; seen edge-on, an
+  // arc. (The broad sheet is deep, so a shorter grazing path saturates it.)
+  float graze=broad ? 3.0 : 7.0;
+  float path=min((b-a)/width,graze)/graze;
+  // The outer thin sheet is sparser, so it never closes into a smooth shell.
+  vec2 sparse=broad ? GAS_WIDE_CLUMPS : vec2(.47,.72)+vec2(.07,.04)*sheet;
+  return strength*smoothstep(sparse.x,sparse.y,clumps)*path*sqrt(path)*7.0*gasKey(m.y/max(rho,.001));
+}
+float gasShockSlab(vec3 ro, vec3 rd, float k, float standoff, float width, float sheet, float behind, float through) {
+  vec2 outerSpan=gasParaboloidSpan(ro,rd,k,-standoff);
+  if (outerSpan.y<=outerSpan.x || outerSpan.y<=0.0) return 0.0;
+  vec2 innerSpan=gasParaboloidSpan(ro,rd,k,-standoff+width);
+  // A ray that misses the inner surface still crosses the sheet twice, on
+  // the near side and the far side of the axis, so it is split where it
+  // would first meet the inner surface; as one long piece it outshone its
+  // neighbours, which drew a bright block at the broad sheet's apex.
+  if (innerSpan.y<=innerSpan.x) {
+    float split=(outerSpan.x+outerSpan.y)*.5;
+    return gasShockPiece(ro,rd,outerSpan.x,split,sheet,standoff,width,behind,through)
+      +gasShockPiece(ro,rd,split,outerSpan.y,sheet,standoff,width,behind,through);
+  }
+  return gasShockPiece(ro,rd,outerSpan.x,min(outerSpan.y,innerSpan.x),sheet,standoff,width,behind,through)
+    +gasShockPiece(ro,rd,max(outerSpan.x,innerSpan.y),outerSpan.y,sheet,standoff,width,behind,through);
+}
+float gasBowShock(vec3 ro, vec3 rd, float behind, float through) {
+  float wide=gasWideSheet();
+  float grow=.35+.65*uGas.y;
+  float shock=0.0;
+  for (int i=0;i<3;i++) {
+    float sheet=float(i);
+    float standoff=(.6+2.2*sheet)*grow, width=(.15+.20*sheet)*uGas.y, k=2.7*(1.20+.35*sheet);
+    float weight=1.0/(1.0+sheet*.6+sheet*sheet*.5);
+    if (i==2) {
+      if (wide<=0.0) break;
+      standoff=GAS_WIDE_STANDOFF*grow; width=GAS_WIDE_WIDTH*uGas.y; k=GAS_WIDE_K; weight=GAS_WIDE_WEIGHT*wide;
+    }
+    // A sharper core inside a softer, wider layer, so the arc has no hard edge.
+    shock+=gasShockSlab(ro,rd,k,standoff,width,sheet,behind,through)*weight*.7;
+    shock+=gasShockSlab(ro,rd,k,standoff+.5*width,1.8*width,sheet,behind,through)*weight*.3;
+  }
+  return shock;
+}
+// Its light: the framing-steady light of the space around the field (so it
+// reads over a void as well as over a bright bank), tinted like the gas swept
+// up in front of the field here, or, where there is none, like the gas
+// streaming onto the nose, read where it still is undisturbed (read through
+// the flow, every ray ahead of the nose met the one streamline that ends on
+// it and drew the shock in horizontal bars).
+vec3 gasBowLight(vec3 ro, vec3 rd, float behind, float through, float horizon) {
+  float shock=gasBowShock(ro,rd,behind,through);
+  if (shock<.001) return vec3(0.0);
+  vec4 swept=vec4(gasSource.rgb,gasSourceHot);
+  if (gasSourceSet<.5) {
+    float hot;
+    vec4 cloud=nebulaAt(ro+rd*max(-dot(ro,rd),0.0)-vec3(GAS_SWEEP,0.0,0.0),horizon,hot);
+    swept=vec4(cloud.rgb,hot);
+  }
+  // Only gently brighter where the swept gas is lit, so the shock is about
+  // as bright over a void as over a bank.
+  float lit=dot(swept.rgb,GAS_LUMA), level=dot(gasSteadyAmbient,GAS_LUMA);
+  vec3 tint=mix(gasSteadyAmbient,level*swept.rgb/max(lit,1e-3),.35)*(.8+.4*smoothstep(.02,.5,lit)+.3*swept.a*swept.a);
+  vec3 light=tint*shock*GAS_SHEET*uGas.x*uNebula*min(uNebulaDensity,1.0);
+  return light/(1.0+dot(light,GAS_LUMA)*2.0);
+}
+// Whether the camera is inside the field (On board): then everything ahead,
+// the bow shock included, is seen through the dark interior.
+float gasCameraInside(vec3 ro) {
+  if (ro.x<=0.0 || ro.x>=GAS_LENGTH) return 0.0;
+  vec3 size=ro.x<10.0 ? vec3(sqrt(2.7*ro.x))
+    : texture2D(uGasBody,vec2((ro.x/GAS_LENGTH*1023.0+.5)/1024.0,.5)).xyz;
+  float depth=max(size.z,.002);
+  float scale=max(ro.y>=0.0?size.x:size.y,.002)/depth;
+  return length(vec2(ro.y/scale,ro.z))<depth ? 1.0 : 0.0;
+}
+#endif
+`;
 
 const environment = /* glsl */`
 uniform float uTravel;
@@ -311,6 +706,9 @@ export const backgroundFragment = /* glsl */`
 ${noise}
 ${environment}
 ${nebula}
+#ifdef GAS_FIELD
+${gasFlow}
+#endif
 varying vec2 vUv;
 uniform mat4 uInverseProjection;
 uniform mat4 uCameraMatrix;
@@ -341,7 +739,17 @@ void main() {
     vec3 gas=vec3(0.0), scattered=vec3(0.0);
     for (int i=5;i>=0;i--) {
       float hot;
+#ifdef GAS_FIELD
+      // The gas streams around the field and is absent inside it. Slices
+      // outside the disturbed flow (beyond the flow table: in the wide shot,
+      // the three far ones) return at once, unchanged.
+      vec3 slice=uCameraPosition+ray*(190.0+float(i)*62.0);
+      GasPoint flow=gasFlow(slice);
+      vec4 cloud=nebulaAt(flow.look,horizon,hot);
+      cloud.a*=flow.outside; hot*=flow.outside;
+#else
       vec4 cloud=nebulaAt(uCameraPosition+ray*(190.0+float(i)*62.0),horizon,hot);
+#endif
       float alpha=1.0-exp(-cloud.a*.95);
       vec3 core=vec3(1.0,.80,1.0)*hot*hot*2.4;
       gas=gas*(1.0-alpha*.75)+(cloud.rgb+core+scattered*(cloud.rgb*1.6+.06))*alpha;
@@ -923,6 +1331,72 @@ vec3 crestLight(Section section, float worldPixel, float key, float patches, flo
 }
 `;
 
+// The light of the gas piled up against the field is the light of the banks
+// it was swept from: the backdrop a little way out from the surface on
+// screen (so the layer under the field glows like the bank below it, and the
+// one over a dark sky stays dim), blended half and half with a framing-steady
+// average (a coarse local mip of the scene capture and its overall average),
+// so its colour does not swing as the camera reframes, and never less than a
+// share of the whole sky.
+const gasAmbientChunk = /* glsl */`
+#ifdef GAS_FIELD
+vec3 gasAmbientAt(vec4 acc) {
+  vec3 c=acc.xyz/max(acc.w,1e-4);
+  vec3 n=normalize(vec3(-max(0.0,6.0-c.x)*.35,c.yz)+vec3(0.0,1e-4,0.0));
+  vec2 out2=(projectPosition(c+n)-projectPosition(c))*uResolution;
+  vec2 dir=out2/max(length(out2),1e-4);
+  vec2 offset=dir*vec2(uResolution.y/uResolution.x,1.0)*.07;
+  vec3 local=textureLod(tScene,clamp(sceneUv(vUv),vec2(.001),vec2(.999)),7.0).rgb;
+  vec3 overall=textureLod(tScene,vec2(.5),12.0).rgb;
+  vec3 steady=local*.35+overall*.65;
+  gasSteadyAmbient=max(steady,skyAverage()*.6);
+  return max(mix(backgroundLod(vUv+offset,4.5),steady,.5),skyAverage()*.6);
+}
+// After the march, shared by both volume shaders. The layer behind the field
+// is laid over what is seen through and around it (before the crest); the
+// layer in front and the bow shock wait for gasInFront. Pixels that meet
+// neither the layer nor the shock's bound skip all of it.
+vec4 gasAheadLayer=vec4(0.0);
+vec3 gasShockLight=vec3(0.0);
+vec3 gasBehindField(vec3 seen, vec4 front, vec4 back, Section section, float interior, vec3 ro, vec3 rd) {
+  bool layer=max(front.w,back.w)>=.01 && uGas.z>0.0;
+  vec2 bound=gasShockBound(ro,rd);
+  if (!layer && bound.y<=bound.x) return seen;
+  float horizon=gasHorizon(rd);
+  vec3 ambient=gasAmbientAt(front.w>back.w ? front : back);
+  gasGather(front,back,horizon);
+  // What is behind the field is seen through its dark interior.
+  float throughInterior=1.0-min(1.0,uInteriorDarkness*clamp(uLensing/.7,0.0,1.0))*interior;
+  // Over a bubble the layer is seen face-on, thin and nearly clear, so the
+  // dark ovals stay dark right up to the lit edge: it reads only at and
+  // outside the silhouette, where it is seen edge-on.
+  float edgeOn=1.0-.92*smoothstep(0.0,.15,section.inside);
+  float through=throughInterior*edgeOn;
+  if (layer) {
+    gasAheadLayer=gasShell(front,ambient)*edgeOn;
+    // (The layer behind is not worth reading where the interior hides it.)
+    if (through>.04) {
+      vec4 behind=gasShell(back,ambient);
+      seen=seen*(1.0-behind.a*.55)+behind.rgb*through;
+    }
+  }
+  if (bound.y>bound.x) {
+    // From inside the field (On board) the whole shock lies beyond the
+    // surface and is seen through the interior, like everything ahead.
+    float inside=gasCameraInside(ro);
+    float entry=section.hit>0.0 ? dot(section.entry-ro,rd) : (inside>.5 ? 0.0 : 1e9);
+    gasShockLight=gasBowLight(ro,rd,entry,inside>.5 ? throughInterior : through,horizon);
+  }
+  return seen;
+}
+// The denser gas in front of the field partly hides what is behind it; the
+// bow shock stands off the nose.
+vec3 gasInFront(vec3 color) {
+  return color*(1.0-gasAheadLayer.a*.55)+gasAheadLayer.rgb+gasShockLight;
+}
+#endif
+`;
+
 export const fluidVolumeFragment = /* glsl */`
 ${noise}
 ${environment}
@@ -959,6 +1433,7 @@ vec2 intersectBox(vec3 ro, vec3 rd) {
 }
 float displacement(vec3 dye) { return (dye.r-.44)*1.35+(dye.b-.50)*.60; }
 ${fieldEffects}
+${gasNearField(false)}
 vec2 projectDirection(vec3 direction) {
   vec3 view=vec3(dot(direction,uCameraMatrix[0].xyz),dot(direction,uCameraMatrix[1].xyz),dot(direction,uCameraMatrix[2].xyz));
   vec4 projected=uProjection*vec4(view,0.0);
@@ -971,6 +1446,7 @@ vec3 crestEnvironment(vec2 screenNormal, vec3 normal, vec3 side, vec3 reflected,
   return reflected*.60+skyAverage()*.40;
 }
 ${fieldCrest}
+${gasAmbientChunk}
 
 void main() {
   vec4 vr=uInverseProjection*vec4(vUv*2.0-1.0,1.0,1.0);
@@ -983,6 +1459,11 @@ void main() {
   // early return here left neighbouring pixels without texture derivatives,
   // which showed as a bright seam along the box edge over a bright sky.
   vec3 p=ro+direction*nearT;
+#ifdef GAS_FIELD
+  // Column of the gas layer in front of the field and behind it (seen through it).
+  vec4 gasFront=vec4(0.0), gasBack=vec4(0.0);
+  float gasEntered=0.0, gasReach=gasLayerReach();
+#endif
   vec3 radiance=vec3(0.0);
   float transmittance=1.0,travelled=nearT;
   vec4 gas=vec4(0.0);
@@ -1016,6 +1497,18 @@ void main() {
     // Resolve a real, thin internal shear sheet, not a fixed centre guide line.
     float sheetExtent=1.0-smoothstep(depth*.70,depth*.98,abs(p.z));
     if (p.x>1.0 && sheetExtent>.001) stepSize=min(stepSize,max(minStep,abs(y)*.45)/max(abs(direction.y),.18));
+#ifdef GAS_FIELD
+    if (baseDistance<0.0) gasEntered=1.0;
+    else if (baseDistance<gasReach) {
+      // Seen edge-on the layer is a long path through piled-up gas; seen
+      // face-on, over a dark interior, it is thin and nearly clear.
+      float facing=1.0-abs(dot(baseNormal,direction));
+      // (Gas within a few units of the camera, in the bow close-ups, is out
+      // of focus and out of the picture.)
+      float gasWeight=gasLayer(baseDistance,p,height,radial/r)*stepSize*(.08+.92*facing*facing)*smoothstep(5.0,20.0,travelled);
+      if (gasEntered>.5) gasBack+=vec4(p,1.0)*gasWeight; else gasFront+=vec4(p,1.0)*gasWeight;
+    }
+#endif
     vec3 nextDirection=direction;
     float axialFade=smoothstep(-1.5,.1,p.x)*tailFade(p.x);
     if (i-4*(i/4)==0) gas=cloudAt(p);
@@ -1120,6 +1613,9 @@ void main() {
   Section section=viewSection(ro,originalDirection);
   float interior=interiorAmount(section,ro,originalDirection);
   vec3 refracted=interiorView(section,ro,direction,interior,uEntrance*min(1.0,uIntensity*.5));
+#ifdef GAS_FIELD
+  refracted=gasBehindField(refracted,gasFront,gasBack,section,interior,ro,originalDirection);
+#endif
   // The same lit shell crest as the compressed appearances, seen through the
   // luminous gas in front of it.
   if (uCrestThickness>0.0 && section.front>0.0) {
@@ -1129,7 +1625,11 @@ void main() {
   }
   // The fluid's gas hardly dimmed the old near-black backdrop; with a nebula
   // behind it, the gas in front occludes it instead of adding to it twice.
+#ifdef GAS_FIELD
+  gl_FragColor=vec4(liftBlacks(gasInFront(refracted*mix(.90+.10*transmittance,transmittance,nebulaOn())+radiance)),1.0);
+#else
   gl_FragColor=vec4(liftBlacks(refracted*mix(.90+.10*transmittance,transmittance,nebulaOn())+radiance),1.0);
+#endif
 }`;
 
 export const volumeFragment = /* glsl */`
@@ -1166,6 +1666,7 @@ vec2 intersectBox(vec3 ro, vec3 rd) {
 }
 float displacement(vec3 dye) { return (dye.r-.44)*1.35+(dye.b-.50)*.60; }
 ${fieldEffects}
+${gasNearField(true)}
 vec3 toView(vec3 direction) {
   return vec3(dot(direction,uCameraMatrix[0].xyz),dot(direction,uCameraMatrix[1].xyz),dot(direction,uCameraMatrix[2].xyz));
 }
@@ -1331,6 +1832,7 @@ vec3 crestEnvironment(vec2 screenNormal, vec3 normal, vec3 side, vec3 reflected,
   return reflected*.75+skyAverage()*.25;
 }
 ${fieldCrest}
+${gasAmbientChunk}
 
 void main() {
   vec4 vr=uInverseProjection*vec4(vUv*2.0-1.0,1.0,1.0);
@@ -1343,6 +1845,11 @@ void main() {
   // early return here left neighbouring pixels without texture derivatives,
   // which showed as a bright seam along the box edge over a bright sky.
   vec3 p=ro+direction*nearT;
+#ifdef GAS_FIELD
+  // Column of the gas layer in front of the field and behind it (seen through it).
+  vec4 gasFront=vec4(0.0), gasBack=vec4(0.0);
+  float gasEntered=0.0, gasReach=gasLayerReach();
+#endif
   float travelled=nearT;
   float closest=1e5;
   vec3 rimPoint=p, rimNormal=vec3(0.0,1.0,0.0);
@@ -1375,6 +1882,18 @@ void main() {
     float wake=smoothstep(8.0,130.0,p.x);
     float minStep=.035+max(p.x,0.0)*.0012;
     float stepSize=min(clamp(abs(baseDistance)*.42,minStep,(farT-nearT)/22.0),farT-travelled);
+#ifdef GAS_FIELD
+    if (baseDistance<0.0) gasEntered=1.0;
+    else if (baseDistance<gasReach) {
+      // Seen edge-on the layer is a long path through piled-up gas; seen
+      // face-on, over a dark interior, it is thin and nearly clear.
+      float facing=1.0-abs(dot(baseNormal,direction));
+      // (Gas within a few units of the camera, in the bow close-ups, is out
+      // of focus and out of the picture.)
+      float gasWeight=gasLayer(baseDistance,p,height,radial/r)*stepSize*(.08+.92*facing*facing)*smoothstep(5.0,20.0,travelled);
+      if (gasEntered>.5) gasBack+=vec4(p,1.0)*gasWeight; else gasFront+=vec4(p,1.0)*gasWeight;
+    }
+#endif
     vec3 nextDirection=direction;
     float axialFade=smoothstep(-1.5,.1,p.x)*tailFade(p.x);
     if (axialFade>0.0 && abs(baseDistance)<(3.0+wake*8.0)) {
@@ -1411,6 +1930,9 @@ void main() {
   // experiment ties the loss to the brightness of the crest above it.
   float interior=interiorAmount(section,ro,originalDirection);
   vec3 color=interiorView(section,ro,direction,interior,fieldLight);
+#ifdef GAS_FIELD
+  color=gasBehindField(color,gasFront,gasBack,section,interior,ro,originalDirection);
+#endif
 
   // The thin optical ribbon at the silhouette, then the thick crest just
   // inside it, laid over the ribbon so the lit edge stays continuous.
@@ -1460,6 +1982,9 @@ void main() {
   centerFade*=1.0-smoothstep(.85,.98,abs(originalDirection.x));
   color=illuminateBand(color,axisNormal,vec3(0.0,1.0,0.0),centerAcross,halfWidth,centerFade,.38,0.0,1.0,1.0,color);
   color+=heroCaustic(abs(closest)/worldPixel,fade);
+#ifdef GAS_FIELD
+  color=gasInFront(color);
+#endif
   gl_FragColor=vec4(liftBlacks(color),1.0);
 }`;
 
