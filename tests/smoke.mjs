@@ -8,7 +8,7 @@ import { checkViewportRefraction } from './viewport-refraction.mjs';
 import { checkFlybyPath, checkFlybyPlayback } from './flyby.mjs';
 import { WarpField, FIELD_LENGTH } from '../src/field.js';
 
-const port = 5176;
+const port = Number(process.env.SMOKE_PORT) || 5176;
 const server = spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], { stdio: 'pipe' });
 let serverOutput = '';
 server.stdout.on('data', d => { serverOutput += d; });
