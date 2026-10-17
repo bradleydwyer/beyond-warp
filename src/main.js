@@ -36,6 +36,30 @@ const state = {
   entrance: 1,
   hidden: false,
 };
+// Effects panel. Every control at 0 (or off) restores the earlier look.
+// Values can also be set from the URL, e.g. ?nebula=0&crestThickness=1.5.
+const EFFECTS = {
+  nebula: 1, nebulaDensity: 1, nebulaGlow: 1, blackLevel: 1,
+  interior: .92, interiorShrink: .6, crestThickness: 1, crestLight: .85, crestVariation: 1,
+  energyRim: true,
+};
+const EFFECT_SLIDERS = Object.keys(EFFECTS).filter(key => typeof EFFECTS[key] === 'number');
+const EFFECT_TOGGLES = Object.keys(EFFECTS).filter(key => typeof EFFECTS[key] === 'boolean');
+const readParam = (key, fallback) => {
+  const raw = params.get(key);
+  if (raw === null) return fallback;
+  if (typeof fallback === 'boolean') return !['0', 'false', 'off'].includes(raw.toLowerCase());
+  if (raw === '' || !Number.isFinite(Number(raw))) return fallback;
+  // Keep URL values inside the slider's own range, so the label, the slider
+  // and the shader always agree (and nothing can go negative).
+  const input = document.getElementById(key);
+  const min = Number(input?.min ?? -Infinity), max = Number(input?.max ?? Infinity);
+  return Math.min(max, Math.max(min, Number(raw)));
+};
+for (const [key, value] of Object.entries(EFFECTS)) state[key] = readParam(key, value);
+// One-click A/B: shows the original look without moving any slider.
+state.effectsBypass = readParam('effectsBypass', false);
+const effectValue = key => state.effectsBypass ? (typeof EFFECTS[key] === 'boolean' ? false : 0) : state[key];
 let renderer, sceneTarget, composer, camera, orbit, background, world, foreground, composite, shipScene, fluid, field;
 let shared, starUniforms, volumeMaterial, bloom, lens, ship, fxaa, starMesh, farStars;
 let lightTarget, lightCamera, lightScene, lightKey = '';
@@ -138,6 +162,10 @@ function init() {
     uCameraMatrix: { value: camera.matrixWorld },
     uCameraPosition: { value: camera.position },
     uResolution: { value: new THREE.Vector2() },
+    uNebula: { value: state.nebula }, uNebulaDensity: { value: state.nebulaDensity }, uNebulaGlow: { value: state.nebulaGlow }, uBlackLevel: { value: state.blackLevel },
+    uInteriorDarkness: { value: state.interior }, uInteriorShrink: { value: state.interiorShrink },
+    uCrestThickness: { value: state.crestThickness }, uCrestLight: { value: state.crestLight },
+    uCrestVariation: { value: state.crestVariation }, uEnergyRim: { value: state.energyRim ? 1 : 0 },
   };
   field = new WarpField(shared.uNoise.value);
   fluid = new ShellFluid(renderer, shared.uNoise.value);
@@ -165,6 +193,7 @@ function init() {
   lightCamera.position.set(80, 0, 0);
   const lightUniforms = {
     uNoise: shared.uNoise, uTravel: shared.uTravel,
+    uNebula: shared.uNebula, uNebulaDensity: shared.uNebulaDensity, uNebulaGlow: shared.uNebulaGlow,
     uInverseProjection: { value: new THREE.Matrix4() },
     uCameraMatrix: { value: new THREE.Matrix4() },
     uCameraPosition: { value: new THREE.Vector3() },
@@ -200,6 +229,7 @@ function init() {
     uTurbulence: { value: state.turbulence }, uIntensity: { value: state.intensity },
     uEntrance: { value: 1 },
     uFluid: { value: fluid.texture },
+    uFluidPatches: { value: fluid.patchTexture },
     uProfile: { value: field.texture },
     uProfileSlope: { value: field.derivativeTexture },
     uLensing: { value: state.lensing }, uProjection: { value: camera.projectionMatrix },
@@ -320,12 +350,29 @@ function bindControls() {
   referenceAudio.addEventListener('error', () => {
     if (reference.active && !reference.silent) useSilentReference();
   });
-  for (const key of ['speed', 'turbulence', 'intensity', 'lensing', 'bloom', 'stars', 'edgeGlow', 'projectionWidth']) {
+  for (const key of ['speed', 'turbulence', 'intensity', 'lensing', 'bloom', 'stars', 'edgeGlow', 'projectionWidth', ...EFFECT_SLIDERS]) {
     $(key).addEventListener('input', () => {
       state[key] = Number($(key).value);
       $(`${key}-value`).textContent = key === 'speed' ? state[key].toFixed(1) : `${Math.round(state[key] * 100)}%`;
     });
   }
+  for (const key of [...EFFECT_TOGGLES, 'effectsBypass']) {
+    $(key).addEventListener('change', () => { state[key] = $(key).checked; syncEffectInputs(); });
+  }
+  $('effects-reset').addEventListener('click', () => {
+    for (const [key, value] of Object.entries(EFFECTS)) state[key] = value;
+    state.effectsBypass = false;
+    syncEffectInputs();
+  });
+  $('effects-off').addEventListener('click', () => {
+    for (const [key, value] of Object.entries(EFFECTS)) state[key] = typeof value === 'boolean' ? false : 0;
+    syncEffectInputs();
+  });
+  syncEffectInputs();
+  // The panel opens upward from the controls bar, so it may only be as tall as
+  // the room above that bar; on short or landscape phones a fixed cap pushed
+  // its top controls off the screen. It scrolls inside that room instead.
+  $('effects').addEventListener('toggle', fitEffectsPanel);
   document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => setView(button.dataset.view)));
   $('quality').addEventListener('change', () => {
     state.quality = $('quality').value;
@@ -346,17 +393,33 @@ function bindControls() {
   $('fullscreen').addEventListener('click', toggleFullscreen);
   $('capture').addEventListener('click', capture);
   document.addEventListener('keydown', (event) => {
-    if (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'A'].includes(document.activeElement?.tagName)) return;
+    if (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'A', 'SUMMARY'].includes(document.activeElement?.tagName)) return;
     if (event.code === 'Space') { event.preventDefault(); togglePlay(); }
     if (event.key.toLowerCase() === 'h') toggleUI();
     if (event.key.toLowerCase() === 'r') restart();
     if (event.key.toLowerCase() === 'f') toggleFullscreen();
   });
-  addEventListener('resize', () => { clearTimeout(resizing); resizing = setTimeout(resize, 80); });
+  addEventListener('resize', () => { clearTimeout(resizing); resizing = setTimeout(() => { resize(); fitEffectsPanel(); }, 80); });
   document.addEventListener('visibilitychange', () => {
     previous = performance.now();
     if (document.hidden && (reference.active || flyby.active) && state.playing) setPlaying(false);
   });
+}
+
+function fitEffectsPanel() {
+  const effects = $('effects');
+  if (!effects.open) return;
+  const room = document.querySelector('.controls').getBoundingClientRect().top - 16;
+  effects.style.setProperty('--effects-room', `${Math.max(96, Math.floor(room))}px`);
+}
+
+function syncEffectInputs() {
+  for (const key of EFFECT_SLIDERS) {
+    $(key).value = state[key];
+    $(`${key}-value`).textContent = `${Math.round(state[key] * 100)}%`;
+  }
+  for (const key of [...EFFECT_TOGGLES, 'effectsBypass']) $(key).checked = state[key];
+  $('effects').classList.toggle('bypassed', state.effectsBypass);
 }
 
 function updateSound() {
@@ -564,6 +627,16 @@ function render(dt) {
   sceneCamera.projectionMatrixInverse.copy(sceneCamera.projectionMatrix).invert();
   shared.uTime.value = state.time;
   shared.uTravel.value = state.travel;
+  shared.uNebula.value = effectValue('nebula');
+  shared.uNebulaDensity.value = effectValue('nebulaDensity');
+  shared.uNebulaGlow.value = effectValue('nebulaGlow');
+  shared.uBlackLevel.value = effectValue('blackLevel');
+  shared.uInteriorDarkness.value = effectValue('interior');
+  shared.uInteriorShrink.value = effectValue('interiorShrink');
+  shared.uCrestThickness.value = effectValue('crestThickness');
+  shared.uCrestLight.value = effectValue('crestLight');
+  shared.uCrestVariation.value = effectValue('crestVariation');
+  shared.uEnergyRim.value = effectValue('energyRim') ? 1 : 0;
   field.update(state.travel);
   volumeMaterial.uniforms.uTailFade.value.set(field.tail.start,field.tail.end);
   volumeMaterial.uniforms.uTailCap.value.set(field.tail.center,field.tail.end,field.tail.upper,field.tail.lower);
@@ -587,14 +660,15 @@ function render(dt) {
   ship.visible = state.ship && state.view !== 'ride';
   ship.rotation.x = Math.sin(state.time * .28) * .028;
   ship.rotation.z = Math.sin(state.time * .21) * .012;
+  const spaceKey = ['nebula', 'nebulaDensity', 'nebulaGlow'].map(effectValue).join('/');
   if (state.appearance === 'glow') {
-    const nextLightKey = `${state.travel}/${state.speed}/${state.stars}/${state.bloom}`;
+    const nextLightKey = `${state.travel}/${state.speed}/${state.stars}/${state.bloom}/${spaceKey}`;
     if (nextLightKey !== lightKey) {
       lightCamera.update(renderer, lightScene);
       lightKey = nextLightKey;
     }
   }
-  const nextOffscreenKey = `${state.travel}/${state.speed}/${state.stars}/${state.bloom}/${camera.position.toArray().join(',')}`;
+  const nextOffscreenKey = `${state.travel}/${state.speed}/${state.stars}/${state.bloom}/${spaceKey}/${camera.position.toArray().join(',')}`;
   if (nextOffscreenKey !== offscreenKey) {
     offscreenCamera.position.copy(camera.position);
     offscreenCamera.update(renderer, lightScene);

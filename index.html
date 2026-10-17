@@ -41,7 +41,33 @@
         <label class="slider-control"><span class="control-label">Light bending <output for="lensing" id="lensing-value">70%</output></span><input id="lensing" type="range" min="0" max="2" step="0.01" value="0.7" /></label>
         <label class="slider-control"><span class="control-label">Bloom <output for="bloom" id="bloom-value">65%</output></span><input id="bloom" type="range" min="0" max="2" step="0.01" value="0.65" /></label>
         <label class="slider-control"><span class="control-label">Star density <output for="stars" id="stars-value">100%</output></span><input id="stars" type="range" min="0" max="2" step="0.01" value="1" /></label>
-        <div class="extra-control"><label class="check-label"><input type="checkbox" id="ship" checked /> Show ship</label><select id="quality" aria-label="Render quality"><option value="balanced">Balanced quality</option><option value="high">High quality</option><option value="low">Low quality</option></select></div>
+        <div class="extra-control"><label class="check-label"><input type="checkbox" id="ship" checked /> Show ship</label><select id="quality" aria-label="Render quality"><option value="balanced">Balanced quality</option><option value="high">High quality</option><option value="low">Low quality</option></select>
+          <details id="effects" class="effects">
+            <summary>Effects</summary>
+            <div class="effects-panel">
+              <fieldset><legend>Space</legend>
+                <label class="effect-slider" title="Brightness of the volumetric nebula behind the field. 0% leaves the original faint fog."><span class="control-label">Nebula brightness <output for="nebula" id="nebula-value">100%</output></span><input id="nebula" type="range" min="0" max="2" step="0.01" value="1" /></label>
+                <label class="effect-slider" title="Coverage of the nebula banks, filaments and dust lanes"><span class="control-label">Nebula density <output for="nebulaDensity" id="nebulaDensity-value">100%</output></span><input id="nebulaDensity" type="range" min="0" max="2" step="0.01" value="1" /></label>
+                <label class="effect-slider" title="Sparse pink-violet highlights and hot knots in the banks, glowing through the gas in front of them. 0% leaves the banks blue."><span class="control-label">Nebula highlights <output for="nebulaGlow" id="nebulaGlow-value">100%</output></span><input id="nebulaGlow" type="range" min="0" max="2" step="0.01" value="1" /></label>
+                <label class="effect-slider" title="Lifts the darkest space to deep blue instead of black"><span class="control-label">Black level <output for="blackLevel" id="blackLevel-value">100%</output></span><input id="blackLevel" type="range" min="0" max="2" step="0.01" value="1" /></label>
+              </fieldset>
+              <fieldset><legend>Field</legend>
+                <label class="effect-slider" title="Darkens light seen through the bubble interiors. Scales with Light bending."><span class="control-label">Interior darkness <output for="interior" id="interior-value">92%</output></span><input id="interior" type="range" min="0" max="1" step="0.01" value="0.92" /></label>
+                <label class="effect-slider" title="Demagnifies and softens the space seen through the interiors. Scales with Light bending."><span class="control-label">Interior shrink <output for="interiorShrink" id="interiorShrink-value">60%</output></span><input id="interiorShrink" type="range" min="0" max="1" step="0.01" value="0.6" /></label>
+                <label class="effect-slider" title="Depth of the lit, churning whitewater band inside the bubble edge, in all three appearances. 0% leaves the original hairline."><span class="control-label">Crest thickness <output for="crestThickness" id="crestThickness-value">100%</output></span><input id="crestThickness" type="range" min="0" max="2" step="0.01" value="1" /></label>
+                <label class="effect-slider" title="Key light from above: how much dimmer the lower edges are than the top"><span class="control-label">Crest lighting (top/bottom) <output for="crestLight" id="crestLight-value">85%</output></span><input id="crestLight" type="range" min="0" max="1" step="0.01" value="0.85" /></label>
+                <label class="effect-slider" title="Large bright and dim patches, chunky whitewater with dark gaps, and a churning skyline, all carried downstream by the flow"><span class="control-label">Crest variation <output for="crestVariation" id="crestVariation-value">100%</output></span><input id="crestVariation" type="range" min="0" max="1.5" step="0.01" value="1" /></label>
+              </fieldset>
+              <fieldset><legend>Experiments</legend>
+                <label class="check-label" title="Experiment: the interiors give up the light the rim gathers, so they darken most under bright crest patches"><input type="checkbox" id="energyRim" checked /> Energy-conserving rim</label>
+              </fieldset>
+              <div class="effects-actions">
+                <label class="check-label" title="Temporarily show the original look without moving the sliders"><input type="checkbox" id="effectsBypass" /> Bypass all effects (A/B)</label>
+                <span><button type="button" id="effects-reset" title="Restore the tuned defaults">Defaults</button><button type="button" id="effects-off" title="Set every effect to 0% / off">All off</button></span>
+              </div>
+            </div>
+          </details>
+        </div>
       </section>
       <footer class="interface footer"><span id="hint">Drag to look around in orbit view</span><div><button id="capture">Save frame</button><span class="separator">/</span><button id="hide">Hide controls <kbd>H</kbd></button></div></footer>
       <button id="show" class="show-controls" hidden>Show controls <kbd>H</kbd></button>

@@ -26,6 +26,14 @@ export class ShellFluid {
     const pair = () => ({ read: target(), write: target(), swap() { [this.read, this.write] = [this.write, this.read]; } });
     this.velocity = pair(); this.dye = pair(); this.pressure = pair();
     this.curl = target(); this.divergence = target(); this.dyeForward = target(); this.dyeBackward = target();
+    // A box-filtered 64×32 copy of the dye: the broad bright and dim stretches
+    // of the flow, without the aliasing of sparse taps on the full grid.
+    this.patches = new THREE.WebGLRenderTarget(width/8, height/8, {
+      type: THREE.HalfFloatType, format: THREE.RGBAFormat,
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      wrapS: THREE.ClampToEdgeWrapping, wrapT: THREE.RepeatWrapping,
+      depthBuffer: false, stencilBuffer: false,
+    });
     const common = /* glsl */`
       precision highp sampler3D;
       varying vec2 vUv;
@@ -84,10 +92,22 @@ export class ShellFluid {
         gl_FragColor=vec4(downstream(vec2(base,0.0)+swirl*uTurbulence),0.0,1.0);
       }
     `);
+    // RGB: transported dye. A: whitewater, spawned where the dye has sharp
+    // fronts and the flow shears, then carried downstream and slowly decaying.
     this.initDye = material(/* glsl */`
-      void main() { gl_FragColor=vec4(sourceNoise(vUv),1.0); }
+      void main() { gl_FragColor=vec4(sourceNoise(vUv),0.0); }
     `);
     this.zero = material('void main() { gl_FragColor=vec4(0.0); }');
+    this.downsample = material(/* glsl */`
+      void main() {
+        // 64 bilinear taps average an overlapping 16×16 block of dye (two
+        // output texels wide), so neighbouring texels change gently.
+        vec4 sum=vec4(0.0);
+        for (int i=0;i<8;i++) for (int j=0;j<8;j++)
+          sum+=sampleAt(uSource,vUv+(vec2(float(i),float(j))-3.5)*2.0*uTexel);
+        gl_FragColor=sum/64.0;
+      }
+    `);
     this.advectVelocity = material(/* glsl */`
       void main() {
         vec2 velocity=sampleAt(uVelocity,vUv).xy;
@@ -165,22 +185,30 @@ export class ShellFluid {
     `);
     this.correctDye = material(/* glsl */`
       void main() {
-        vec3 original=sampleAt(uSource,vUv).rgb;
-        vec3 forward=sampleAt(uForward,vUv).rgb;
-        vec3 reverse=sampleAt(uBackward,vUv).rgb;
-        vec3 dye=forward+.5*(original-reverse);
+        vec4 original=sampleAt(uSource,vUv);
+        vec4 forward=sampleAt(uForward,vUv);
+        vec4 reverse=sampleAt(uBackward,vUv);
+        vec4 dye=forward+.5*(original-reverse);
         vec2 p=vUv-sampleAt(uVelocity,vUv).xy*uDt*uTexel;
         vec2 cell=(floor(p/uTexel-.5)+.5)*uTexel;
-        vec3 a=sampleAt(uSource,cell).rgb;
-        vec3 b=sampleAt(uSource,cell+vec2(uTexel.x,0.0)).rgb;
-        vec3 c=sampleAt(uSource,cell+vec2(0.0,uTexel.y)).rgb;
-        vec3 d=sampleAt(uSource,cell+uTexel).rgb;
+        vec4 a=sampleAt(uSource,cell);
+        vec4 b=sampleAt(uSource,cell+vec2(uTexel.x,0.0));
+        vec4 c=sampleAt(uSource,cell+vec2(0.0,uTexel.y));
+        vec4 d=sampleAt(uSource,cell+uTexel);
         dye=clamp(dye,min(min(a,b),min(c,d)),max(max(a,b),max(c,d)));
-        dye*=exp(-uDt*.018);
+        dye.rgb*=exp(-uDt*.018);
         vec3 injection=sourceNoise(vUv);
         float source=1.0-smoothstep(.008,.065,vUv.x);
-        dye=mix(dye,injection,source*(1.0-exp(-uDt*8.0)));
-        gl_FragColor=vec4(clamp(dye,0.0,1.0),1.0);
+        dye.rgb=mix(dye.rgb,injection,source*(1.0-exp(-uDt*8.0)));
+        // Whitewater forms on sharp dye fronts where the flow shears.
+        vec2 gr=vec2(sampleAt(uSource,vUv+vec2(uTexel.x,0.0)).r-sampleAt(uSource,vUv-vec2(uTexel.x,0.0)).r,
+                     sampleAt(uSource,vUv+vec2(0.0,uTexel.y)).r-sampleAt(uSource,vUv-vec2(0.0,uTexel.y)).r);
+        vec2 gb=vec2(sampleAt(uSource,vUv+vec2(uTexel.x,0.0)).b-sampleAt(uSource,vUv-vec2(uTexel.x,0.0)).b,
+                     sampleAt(uSource,vUv+vec2(0.0,uTexel.y)).b-sampleAt(uSource,vUv-vec2(0.0,uTexel.y)).b);
+        float shear=abs(sampleAt(uCurl,vUv).x);
+        float spawn=smoothstep(.06,.30,length(gr)+length(gb)*.6)*(.30+.70*smoothstep(2.0,16.0,shear));
+        dye.a=dye.a*exp(-uDt*1.5)+spawn*uDt*2.2;
+        gl_FragColor=clamp(dye,0.0,1.0);
       }
     `);
     this.reset();
@@ -199,7 +227,13 @@ export class ShellFluid {
     this.pass(this.initVelocity, this.velocity.read);
     this.pass(this.initDye, this.dye.read);
     this.pass(this.zero, this.pressure.read);
+    this.updatePatches();
     this.renderer.setRenderTarget(previous);
+  }
+
+  updatePatches() {
+    this.uniforms.uSource.value = this.dye.read.texture;
+    this.pass(this.downsample, this.patches);
   }
 
   update(dt, speed, turbulence) {
@@ -208,6 +242,7 @@ export class ShellFluid {
     const u = this.uniforms;
     u.uSpeed.value = speed; u.uTurbulence.value = turbulence;
     // Fixed simulation step: results do not change with display refresh rate.
+    const stepped = this.accumulator >= 1/60;
     while (this.accumulator >= 1/60) {
       const step = 1/60; this.accumulator -= step; this.time += step;
       // Integrate transport phase so changing speed never jumps the inlet pattern.
@@ -234,9 +269,11 @@ export class ShellFluid {
       u.uForward.value = this.dyeForward.texture; u.uBackward.value = this.dyeBackward.texture;
       this.pass(this.correctDye, this.dye.write); this.dye.swap();
     }
+    if (stepped) this.updatePatches();
     this.renderer.setRenderTarget(previous);
   }
 
   get texture() { return this.dye.read.texture; }
   get velocityTexture() { return this.velocity.read.texture; }
+  get patchTexture() { return this.patches.texture; }
 }

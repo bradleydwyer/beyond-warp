@@ -6,6 +6,7 @@ import { REFERENCE_DURATION, referenceCameraAt } from '../src/reference-sequence
 import { checkOpticalLight } from './optical-light.mjs';
 import { checkViewportRefraction } from './viewport-refraction.mjs';
 import { checkFlybyPath, checkFlybyPlayback } from './flyby.mjs';
+import { checkEffects, checkEffectsLayout } from './effects.mjs';
 import { WarpField, FIELD_LENGTH } from '../src/field.js';
 
 const port = Number(process.env.SMOKE_PORT) || 5176;
@@ -286,7 +287,7 @@ try {
   await page.waitForTimeout(200);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
   assert.equal(overflow, false, 'Mobile layout overflows horizontally');
-  for (const id of ['speed', 'turbulence', 'intensity', 'lensing', 'bloom', 'stars', 'appearance', 'quality', 'reference-play', 'reference-sound']) {
+  for (const id of ['speed', 'turbulence', 'intensity', 'lensing', 'bloom', 'stars', 'appearance', 'quality', 'effects', 'reference-play', 'reference-sound']) {
     const box = await page.locator(`#${id}`).boundingBox();
     assert(box && box.x >= 0 && box.x + box.width <= 390 && box.y + box.height <= 844, `${id} is off-screen`);
   }
@@ -325,6 +326,8 @@ try {
   console.log('PASS: unavailable audio falls back to silent camera playback');
   await checkOpticalLight(browser, `http://127.0.0.1:${port}`);
   await checkViewportRefraction(browser, `http://127.0.0.1:${port}`);
+  await checkEffects(browser, `http://127.0.0.1:${port}`);
+  await checkEffectsLayout(browser, `http://127.0.0.1:${port}`);
   assert.deepEqual(errors, [], `Browser errors: ${errors.join('\n')}`);
   console.log('All visual smoke checks passed.');
 } finally {

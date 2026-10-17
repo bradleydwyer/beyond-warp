@@ -46,7 +46,9 @@ export async function checkOpticalLight(browser, url) {
       ['blue', 'vec3(0.0,0.0,.004)', 2],
     ]) {
       tint = color;
-      await page.goto(`${url}/?paused`);
+      // The black-level lift is a display toe added to the final field image,
+      // not light the field emits, so it is switched off for this measurement.
+      await page.goto(`${url}/?paused&blackLevel=0`);
       await page.waitForFunction(() => window.warp && document.getElementById('loading').hidden);
       await setRange('stars', 0);
       await page.locator('#ship').uncheck();
