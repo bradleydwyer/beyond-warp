@@ -33,6 +33,11 @@ export class ShellFluid {
       uniform sampler3D uNoise;
       uniform vec2 uTexel;
       uniform float uDt, uTime, uTravel, uSpeed, uTurbulence;
+      // The shell carries ripples into the wake. Allow angular rolling, but
+      // prevent vortex forces or pressure correction reversing axial flow.
+      vec2 downstream(vec2 velocity) {
+        return clamp(velocity, vec2((20.0+uSpeed*4.0)*.4,-100.0), vec2(170.0));
+      }
       vec2 coord(vec2 p) { return vec2(clamp(p.x, uTexel.x*.5, 1.0-uTexel.x*.5), fract(p.y)); }
       vec4 sampleAt(sampler2D tex, vec2 p) { return texture2D(tex, coord(p)); }
       float n(vec3 p) { return texture(uNoise, (p+.5)/64.0).r; }
@@ -76,7 +81,7 @@ export class ShellFluid {
         float a=vUv.y*6.2831853;
         float base=20.0+uSpeed*4.0;
         vec2 swirl=eddies(vUv,0.0)*.6;
-        gl_FragColor=vec4(vec2(base,0.0)+swirl*uTurbulence,0.0,1.0);
+        gl_FragColor=vec4(downstream(vec2(base,0.0)+swirl*uTurbulence),0.0,1.0);
       }
     `);
     this.initDye = material(/* glsl */`
@@ -94,7 +99,7 @@ export class ShellFluid {
         previous+=eddies(vUv,uTime)*uDt*uTurbulence;
         previous=mix(previous,vec2(base,0.0),uDt*.06);
         previous=mix(previous,vec2(base,sin(a*5.0+uTime)*12.0*uTurbulence), (1.0-smoothstep(.0,.04,vUv.x))*.5);
-        gl_FragColor=vec4(clamp(previous,vec2(-100.0),vec2(170.0)),0.0,1.0);
+        gl_FragColor=vec4(downstream(previous),0.0,1.0);
       }
     `);
     this.computeCurl = material(/* glsl */`
@@ -117,7 +122,7 @@ export class ShellFluid {
         gradient/=length(gradient)+.0001;
         vec2 force=vec2(gradient.y,-gradient.x)*c*14.0*uTurbulence;
         vec2 velocity=sampleAt(uVelocity,vUv).xy+force*uDt;
-        gl_FragColor=vec4(clamp(velocity,vec2(-100),vec2(170)),0,1);
+        gl_FragColor=vec4(downstream(velocity),0,1);
       }
     `);
     this.computeDivergence = material(/* glsl */`
@@ -146,7 +151,7 @@ export class ShellFluid {
         float b=sampleAt(uPressure,vUv-vec2(0,uTexel.y)).x;
         float t=sampleAt(uPressure,vUv+vec2(0,uTexel.y)).x;
         vec2 velocity=sampleAt(uVelocity,vUv).xy-vec2(r-l,t-b)*.5;
-        gl_FragColor=vec4(velocity,0,1);
+        gl_FragColor=vec4(downstream(velocity),0,1);
       }
     `);
     this.advectDye = material(/* glsl */`

@@ -80,14 +80,26 @@ export class WarpField {
       top.push([a.center,a.upper]); bottom.push([a.center,a.lower]);
       const b=this.lobes[i+1];
       const fraction=b?a.halfLength/(a.halfLength+b.halfLength):0;
-      top.push([a.center+a.halfLength,lerp(a.upper,b?.upper??a.upper,fraction)*.76]);
-      bottom.push([a.center+a.halfLength,lerp(a.lower,b?.lower??a.lower,fraction)*.99]);
+      top.push([a.center+a.halfLength,b?lerp(a.upper,b.upper,fraction)*.76:0]);
+      bottom.push([a.center+a.halfLength,b?lerp(a.lower,b.lower,fraction)*.99:0]);
     });
+    const last=this.lobes.at(-1);
+    this.tail={ start:last.center-last.halfLength, center:last.center,
+      end:Math.min(FIELD_LENGTH,last.center+last.halfLength), upper:last.upper, lower:last.lower };
     const upper=spline(top), lower=spline(bottom);
     for (let i=0; i<samples; i++) {
       const x=i/(samples-1)*FIELD_LENGTH;
       let [u,du]=upper(x), [l,dl]=lower(x);
       if (x<10) { u=l=Math.sqrt(Math.max(.00001,2.7*x)); du=dl=1.35/u; }
+      if (x>=this.tail.center) {
+        // An ellipsoidal rear cap has a horizontal tangent at the last crest
+        // and a rounded, vertical tangent at the shared closing point.
+        const length=this.tail.end-this.tail.center;
+        const t=THREE.MathUtils.clamp((x-this.tail.center)/length,0,1);
+        const cap=Math.sqrt(Math.max(.00000001,1-t*t));
+        u=last.upper*cap; l=last.lower*cap;
+        du=-last.upper*t/(length*cap); dl=-last.lower*t/(length*cap);
+      }
       this.data.set([u,l,(u+l)*.5,0],i*4);
       this.derivatives.set([du,dl,(du+dl)*.5,0],i*4);
     }

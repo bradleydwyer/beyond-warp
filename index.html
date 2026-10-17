@@ -10,7 +10,7 @@
   </head>
   <body>
     <main id="app">
-      <canvas id="scene" aria-label="Animated 3D warp bubble with a starship and streaming blue plasma"></canvas>
+      <canvas id="scene" aria-label="Animated 3D warp bubble bending starlight around a starship"></canvas>
       <div class="frame top-frame"></div><div class="frame bottom-frame"></div>
       <header class="interface masthead">
         <div class="identity"><span class="insignia" aria-hidden="true"></span><div><h1>BEYOND</h1><p>Warp field study</p></div></div>
@@ -33,11 +33,14 @@
           <button class="play-button" id="play" aria-label="Pause animation" title="Pause (Space)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6v12M16 6v12"/></svg></button>
           <button class="replay-button" id="replay" title="Restart (R)" aria-label="Restart animation">↺</button>
         </div>
-        <div class="view-control"><span class="control-label">Camera</span><div class="segmented" aria-label="Camera view"><button data-view="tracking" aria-pressed="true">Tracking</button><button data-view="bow" aria-pressed="false">Bow</button><button data-view="orbit" aria-pressed="false">Orbit</button><button data-view="ride" aria-pressed="false">On board</button></div></div>
+        <div class="view-control"><span class="control-label">Camera</span><div class="segmented" role="group" aria-label="Camera view"><button data-view="tracking" aria-pressed="true">Tracking</button><button data-view="bow" aria-pressed="false">Bow</button><button data-view="orbit" aria-pressed="false">Orbit</button><button data-view="ride" aria-pressed="false">On board</button><button data-view="flyby" aria-pressed="false" title="Follow the ship as it overtakes the camera, pulling back to reveal the full field">Flyby</button></div></div>
+        <div class="appearance-control"><span class="control-label" id="appearance-label">Field appearance</span><div id="appearance" class="appearance-toggle" role="group" aria-labelledby="appearance-label"><button type="button" data-appearance="fluid" aria-pressed="false">Fluid glow</button><button type="button" data-appearance="glow" aria-pressed="true">Compressed glow</button><button type="button" data-appearance="space" aria-pressed="false">Compressed space</button></div><div id="space-controls" class="space-controls" hidden><label id="edge-glow-control" class="edge-glow-control" title="Brighten and bloom the outer background projections"><span class="control-label">Edge glow <output for="edgeGlow" id="edgeGlow-value">0%</output></span><input id="edgeGlow" type="range" min="0" max="3" step="0.01" value="0" /></label><label class="edge-glow-control"><span class="control-label">Projection width <output for="projectionWidth" id="projectionWidth-value">200%</output></span><input id="projectionWidth" type="range" min="0.5" max="4" step="0.01" value="2" /></label></div></div>
         <label class="slider-control"><span class="control-label">Warp speed <output for="speed" id="speed-value">10.0</output></span><input id="speed" type="range" min="1" max="10" step="0.1" value="10" /></label>
         <label class="slider-control"><span class="control-label">Turbulence <output for="turbulence" id="turbulence-value">150%</output></span><input id="turbulence" type="range" min="0" max="1.5" step="0.01" value="1.5" /></label>
         <label class="slider-control"><span class="control-label">Field intensity <output for="intensity" id="intensity-value">200%</output></span><input id="intensity" type="range" min="0" max="2" step="0.01" value="2" /></label>
         <label class="slider-control"><span class="control-label">Light bending <output for="lensing" id="lensing-value">70%</output></span><input id="lensing" type="range" min="0" max="2" step="0.01" value="0.7" /></label>
+        <label class="slider-control"><span class="control-label">Bloom <output for="bloom" id="bloom-value">65%</output></span><input id="bloom" type="range" min="0" max="2" step="0.01" value="0.65" /></label>
+        <label class="slider-control"><span class="control-label">Star density <output for="stars" id="stars-value">100%</output></span><input id="stars" type="range" min="0" max="2" step="0.01" value="1" /></label>
         <div class="extra-control"><label class="check-label"><input type="checkbox" id="ship" checked /> Show ship</label><select id="quality" aria-label="Render quality"><option value="balanced">Balanced quality</option><option value="high">High quality</option><option value="low">Low quality</option></select></div>
       </section>
       <footer class="interface footer"><span id="hint">Drag to look around in orbit view</span><div><button id="capture">Save frame</button><span class="separator">/</span><button id="hide">Hide controls <kbd>H</kbd></button></div></footer>

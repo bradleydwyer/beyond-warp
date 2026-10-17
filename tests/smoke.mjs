@@ -3,6 +3,10 @@ import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 import { chromium } from '@playwright/test';
 import { REFERENCE_DURATION, referenceCameraAt } from '../src/reference-sequence.js';
+import { checkOpticalLight } from './optical-light.mjs';
+import { checkViewportRefraction } from './viewport-refraction.mjs';
+import { checkFlybyPath, checkFlybyPlayback } from './flyby.mjs';
+import { WarpField, FIELD_LENGTH } from '../src/field.js';
 
 const port = 5176;
 const server = spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], { stdio: 'pipe' });
@@ -35,6 +39,26 @@ const checkLobeOrder = shape => {
 const setRange = async (page, id, value) => page.locator(`#${id}`).evaluate((el, v) => { el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); }, String(value));
 
 try {
+  checkFlybyPath();
+  const tailNoise = new Uint8Array(64*64*64*4);
+  let seed = 1701;
+  for (let i=0;i<tailNoise.length;i++) { seed = (Math.imul(seed,1664525)+1013904223)>>>0; tailNoise[i] = seed>>>24; }
+  const tailField = new WarpField({ image: { data: tailNoise } });
+  for (const travel of [12,800,4000,12000]) {
+    tailField.update(travel);
+    const tail = tailField.tail;
+    assert(tail.start < tail.center && tail.center < tail.end && tail.end <= FIELD_LENGTH);
+    let previous = Infinity;
+    for (let i=Math.ceil(tail.center/FIELD_LENGTH*1023);i<1024;i++) {
+      const height = tailField.data[i*4]+tailField.data[i*4+1];
+      assert(height <= previous+.0001, 'Last bubble does not converge smoothly to its rear tip');
+      assert(Number.isFinite(tailField.derivatives[i*4]), 'Rear cap has a non-finite normal');
+      previous = height;
+    }
+    assert(previous < .02, 'Upper and lower edges do not close at the shared tail point');
+  }
+  tailField.texture.dispose(); tailField.derivativeTexture.dispose();
+  console.log('PASS: changing bubble sizes retain a rounded, closed tail');
   // Regression for the speed kink at the old keyframe joins near two seconds.
   const h = .001;
   const acceleration = (t, key) => (referenceCameraAt(t+h)[key]-2*referenceCameraAt(t)[key]+referenceCameraAt(t-h)[key])/(h*h);
@@ -69,7 +93,21 @@ try {
   await page.goto(`http://127.0.0.1:${port}/?paused`);
   await page.waitForFunction(() => window.warp && document.getElementById('loading').hidden);
   assert.equal(await page.locator('#error').isVisible(), false);
+  const optical = await metrics(page);
+  await page.locator('[data-appearance="fluid"]').click();
   const first = await metrics(page);
+  assert.notEqual(first.hash, optical.hash, 'Field appearances render identically');
+  assert(optical.mean > 1 && optical.mean < 100, 'Compressed glow is blank or overexposed');
+  await page.locator('[data-appearance="glow"]').click();
+  assert.equal((await metrics(page)).hash, optical.hash, 'Changing appearance reset or altered the simulation');
+  await page.screenshot({ path: 'artifacts/compressed-glow.png' });
+  await page.locator('[data-appearance="space"]').click();
+  const reprojected = await metrics(page);
+  assert.notEqual(reprojected.hash, optical.hash, 'Compressed space still includes the concentrated glow');
+  assert(reprojected.mean > 1 && reprojected.mean < optical.mean, 'Reprojected space is blank or includes the glow');
+  await page.screenshot({ path: 'artifacts/compressed-space.png' });
+  await page.locator('[data-appearance="fluid"]').click();
+  console.log('PASS: all three field appearances render and switch without resetting the simulation');
   const initialShape = await page.evaluate(() => window.warp.fieldShape);
   checkLobeOrder(initialShape);
   assert(first.mean > 2 && first.mean < 100, `Unexpected initial luminance: ${first.mean}`);
@@ -118,6 +156,41 @@ try {
   await setRange(page, 'lensing', .7);
   console.log('PASS: refraction bends the background independently of glow');
 
+  const glowing = await metrics(page);
+  await setRange(page, 'bloom', 0);
+  const noBloom = await metrics(page);
+  assert(noBloom.mean < glowing.mean, 'Bloom control did not reduce glow');
+  await setRange(page, 'stars', 0);
+  const noStars = await metrics(page);
+  assert.notEqual(noStars.hash, noBloom.hash, 'Zero star density did not remove stars');
+  await setRange(page, 'stars', 2);
+  assert.notEqual((await metrics(page)).hash, noStars.hash, 'Star density did not add stars');
+  await setRange(page, 'bloom', .65);
+  await setRange(page, 'stars', 1);
+  console.log('PASS: bloom and star density controls change the rendered scene');
+
+  // Looking back at the original camera side must still reveal moving stars.
+  await page.locator('[data-view="orbit"]').click();
+  await page.mouse.move(500, 300);
+  await page.mouse.down();
+  await page.mouse.move(950, 300, { steps: 30 });
+  await page.mouse.up();
+  await page.waitForTimeout(700);
+  for (let i=0;i<100;i++) await page.evaluate(() => window.warp.render());
+  const reverseCamera = await page.evaluate(() => window.warp.reference.camera);
+  assert(reverseCamera[2] < 0, 'Orbit did not reach the reverse side of the field');
+  await setRange(page, 'stars', 0);
+  const reverseNoStars = await metrics(page);
+  await setRange(page, 'stars', 1);
+  const reverseStars = await metrics(page);
+  assert(reverseStars.mean > reverseNoStars.mean+.2, 'Reverse view has no visible star field');
+  await page.screenshot({ path: 'artifacts/orbit-reverse-fluid.png' });
+  await page.locator('[data-appearance="glow"]').click();
+  assert.equal((await metrics(page)).glError, 0);
+  await page.screenshot({ path: 'artifacts/orbit-reverse-optical.png' });
+  await page.locator('[data-appearance="fluid"]').click();
+  console.log('PASS: stars surround the field and both appearances work from the reverse side');
+
   for (const view of ['orbit', 'bow', 'ride', 'tracking']) {
     await page.locator(`[data-view="${view}"]`).click();
     await page.evaluate(() => window.warp.render());
@@ -145,9 +218,13 @@ try {
   assert(download.suggestedFilename().endsWith('.png'));
   console.log('PASS: four cameras, quality modes, ship toggle, hidden UI, PNG export');
 
+  await setRange(page, 'bloom', .4);
+  await setRange(page, 'stars', .8);
   await page.getByRole('button', { name: 'Play reference sequence', exact: true }).click();
   await page.waitForFunction(() => window.warp.reference.time > .45);
   const close = await page.evaluate(() => window.warp.reference);
+  assert.deepEqual(await page.evaluate(() => [window.warp.state.bloom, window.warp.state.stars]), [.4, .8], 'Replay reset bloom or star density');
+  assert.equal(await page.evaluate(() => window.warp.state.appearance), 'fluid', 'Replay reset field appearance');
   assert(close.active && !close.silent && !close.audioPaused, 'Original audio did not start with the sequence');
   assert(Math.abs(close.time-close.audioTime) < .1, 'Camera drifted from the audio clock');
   await page.getByRole('button', { name: 'Pause animation', exact: true }).click();
@@ -204,11 +281,12 @@ try {
   await page.locator('[data-view="tracking"]').click();
   console.log('PASS: synchronised audio and camera, continued simulation after the end, pause/resume, mute, replay, and view cancellation');
 
+  await checkFlybyPlayback(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(200);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
   assert.equal(overflow, false, 'Mobile layout overflows horizontally');
-  for (const id of ['speed', 'turbulence', 'intensity', 'lensing', 'quality', 'reference-play', 'reference-sound']) {
+  for (const id of ['speed', 'turbulence', 'intensity', 'lensing', 'bloom', 'stars', 'appearance', 'quality', 'reference-play', 'reference-sound']) {
     const box = await page.locator(`#${id}`).boundingBox();
     assert(box && box.x >= 0 && box.x + box.width <= 390 && box.y + box.height <= 844, `${id} is off-screen`);
   }
@@ -245,6 +323,8 @@ try {
   assert.equal(await unavailable.locator('#error').isVisible(), false);
   await unavailable.close();
   console.log('PASS: unavailable audio falls back to silent camera playback');
+  await checkOpticalLight(browser, `http://127.0.0.1:${port}`);
+  await checkViewportRefraction(browser, `http://127.0.0.1:${port}`);
   assert.deepEqual(errors, [], `Browser errors: ${errors.join('\n')}`);
   console.log('All visual smoke checks passed.');
 } finally {
