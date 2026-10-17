@@ -10,6 +10,7 @@ import { fullscreenVertex, backgroundFragment, starVertex, starFragment, volumeF
 import { createShip } from './ship.js';
 import { ShellFluid } from './fluid.js';
 import { WarpField } from './field.js';
+import { REFERENCE_DURATION, referenceCameraAt } from './reference-sequence.js';
 import './style.css';
 
 const $ = (id) => document.getElementById(id);
@@ -33,6 +34,10 @@ let renderer, sceneTarget, composer, camera, orbit, background, world, composite
 let shared, starUniforms, volumeMaterial, bloom, lens, ship, fxaa;
 let previous = performance.now(), frames = 0, fpsStart = previous, fps = 0;
 let noticeTimer, resizing;
+const reference = { active: false, time: 0, loading: false, silent: false, finished: false, revision: 0 };
+const referenceAudio = $('reference-audio');
+referenceAudio.src = `${import.meta.env.BASE_URL}audio/beyond-reference.m4a`;
+referenceAudio.volume = .75;
 const cameraTarget = new THREE.Vector3(130, 0, 0);
 const desiredPosition = new THREE.Vector3();
 const desiredTarget = new THREE.Vector3();
@@ -170,11 +175,13 @@ function init() {
   window.warp = {
     get state() { return { ...state, fps, simulationTime: fluid.time }; },
     get fieldShape() { return field.lobes.map(lobe => ({ ...lobe })); },
+    get reference() { return { ...reference, duration: REFERENCE_DURATION, audioTime: referenceAudio.currentTime, audioPaused: referenceAudio.paused, camera: camera.position.toArray(), target: cameraTarget.toArray() }; },
     setView,
-    seek(time) { state.time = time; state.travel = time * (12 + state.speed * 6); state.entrance = 1; fluid.reset(); for (let i=0; i<Math.min(600, Math.round(time*60)); i++) fluid.update(1/60,state.speed,state.turbulence); },
-    pause() { state.playing = false; updatePlay(); },
-    play() { state.playing = true; updatePlay(); },
+    seek(time) { if (reference.active) setView('tracking'); state.time = time; state.travel = time * (12 + state.speed * 6); state.entrance = 1; fluid.reset(); for (let i=0; i<Math.min(600, Math.round(time*60)); i++) fluid.update(1/60,state.speed,state.turbulence); },
+    pause() { setPlaying(false); },
+    play() { setPlaying(true); },
     advance(seconds) {
+      if (reference.active) setView('tracking');
       const steps = Math.round(THREE.MathUtils.clamp(Number(seconds) || 0, 0, 60) * 60);
       for (let i=0; i<steps; i++) {
         state.time += 1/60; state.travel += (12+state.speed*6)/60;
@@ -207,17 +214,30 @@ function resize() {
 
 function setView(view) {
   if (!['tracking', 'bow', 'orbit', 'ride'].includes(view)) return;
+  stopReference();
   state.view = view;
   orbit.enabled = view === 'orbit';
   if (orbit.enabled) { orbit.target.copy(cameraTarget); orbit.update(); }
   document.querySelectorAll('[data-view]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.view === view)));
   $('view-label').textContent = { tracking: 'EXTERIOR / WIDE WAKE', bow: 'EXTERIOR / BOW CLOSE-UP', orbit: 'EXTERIOR / FREE ORBIT', ride: 'INTERIOR / ON BOARD' }[view];
   $('hint').textContent = view === 'orbit' ? 'Drag to orbit · Scroll to move closer · Right-drag to pan' : view === 'ride' ? 'Looking forward through the compression front' : view === 'bow' ? 'Rounded compression front · Refracted starlight' : 'Drag to look around in orbit view';
+  updatePlay();
 }
 
 function bindControls() {
   $('play').addEventListener('click', togglePlay);
   $('replay').addEventListener('click', restart);
+  $('reference-play').addEventListener('click', startReference);
+  $('reference-sound').addEventListener('click', () => {
+    referenceAudio.muted = !referenceAudio.muted;
+    $('reference-sound').setAttribute('aria-pressed', String(!referenceAudio.muted));
+    const label = referenceAudio.muted ? 'Unmute reference audio' : 'Mute reference audio';
+    $('reference-sound').setAttribute('aria-label', label);
+    $('reference-sound').title = label;
+  });
+  referenceAudio.addEventListener('error', () => {
+    if (reference.active && !reference.silent) useSilentReference();
+  });
   for (const key of ['speed', 'turbulence', 'intensity', 'lensing']) {
     $(key).addEventListener('input', () => {
       state[key] = Number($(key).value);
@@ -243,17 +263,114 @@ function bindControls() {
     if (event.key.toLowerCase() === 'f') toggleFullscreen();
   });
   addEventListener('resize', () => { clearTimeout(resizing); resizing = setTimeout(resize, 80); });
-  document.addEventListener('visibilitychange', () => { previous = performance.now(); });
+  document.addEventListener('visibilitychange', () => {
+    previous = performance.now();
+    if (document.hidden && reference.active && state.playing) setPlaying(false);
+  });
 }
 
-function togglePlay() { state.playing = !state.playing; updatePlay(); }
+function startReference() {
+  referenceAudio.pause();
+  referenceAudio.currentTime = 0;
+  Object.assign(reference, { active: true, time: 0, loading: false, silent: false, finished: false });
+  Object.assign(state, { time: 4, travel: 12, entrance: 1, view: 'reference', speed: 8, turbulence: .65, intensity: 1, lensing: .7, ship: true });
+  orbit.enabled = false;
+  for (const key of ['speed', 'turbulence', 'intensity', 'lensing']) {
+    $(key).value = state[key];
+    $(`${key}-value`).textContent = key === 'speed' ? state[key].toFixed(1) : `${Math.round(state[key]*100)}%`;
+  }
+  $('ship').checked = true;
+  document.querySelectorAll('[data-view]').forEach(button => button.setAttribute('aria-pressed', 'false'));
+  $('view-label').textContent = 'REFERENCE / CAMERA SEQUENCE';
+  $('hint').textContent = 'Original camera pullback · Space to pause picture and sound';
+  $('reference-action').textContent = 'Replay reference';
+  $('reference-time').textContent = '0.00 / 4.96 s';
+  $('reference-progress').style.transform = 'scaleX(0)';
+  $('reference-play').setAttribute('aria-label', 'Replay reference sequence');
+  fluid.reset();
+  for (let i=0; i<90; i++) fluid.update(1/60, state.speed, state.turbulence);
+  render(0);
+  setPlaying(true);
+}
+
+function stopReference() {
+  if (!reference.active) return;
+  reference.revision++;
+  referenceAudio.pause();
+  reference.active = false;
+  reference.loading = false;
+  $('reference-action').textContent = 'Play reference';
+  $('reference-play').setAttribute('aria-label', 'Play reference sequence');
+  $('reference-time').textContent = 'Original audio · 4.96 s';
+  $('reference-progress').style.transform = 'scaleX(0)';
+}
+
+function useSilentReference() {
+  referenceAudio.pause();
+  reference.silent = true;
+  reference.loading = false;
+  notice('Reference audio could not play. The camera sequence will continue silently.');
+  updatePlay();
+}
+
+function setPlaying(playing) {
+  state.playing = playing;
+  if (reference.active && !reference.finished) {
+    const revision = ++reference.revision;
+    if (!playing) {
+      if (!reference.silent && !reference.loading) advanceReferenceTo(referenceAudio.currentTime);
+      referenceAudio.pause();
+      reference.loading = false;
+      render(0);
+    } else if (!reference.silent) {
+      reference.loading = true;
+      referenceAudio.play().then(() => {
+        if (!reference.active || revision !== reference.revision) return;
+        reference.loading = false;
+        previous = performance.now();
+        updatePlay();
+      }).catch(() => {
+        if (reference.active && revision === reference.revision) useSilentReference();
+      });
+    }
+  }
+  previous = performance.now();
+  updatePlay();
+}
+
+function advanceReferenceTo(time) {
+  const next = Math.min(REFERENCE_DURATION, Math.max(reference.time, time));
+  const dt = next-reference.time;
+  state.time += dt;
+  state.travel += dt*(12+state.speed*6);
+  // Keep the solver stable after a delayed frame; the camera and environment
+  // always use the media clock, never an independently drifting RAF timer.
+  let remaining = Math.min(dt, .25);
+  while (remaining > .000001) {
+    const step = Math.min(remaining, 1/60);
+    fluid.update(step, state.speed, drivenTurbulence());
+    remaining -= step;
+  }
+  reference.time = next;
+  $('reference-time').textContent = `${next.toFixed(2)} / ${REFERENCE_DURATION.toFixed(2)} s${reference.silent ? ' · silent' : ''}`;
+  $('reference-progress').style.transform = `scaleX(${next/REFERENCE_DURATION})`;
+  if (next >= REFERENCE_DURATION) {
+    reference.finished = true;
+    referenceAudio.pause();
+    $('view-label').textContent = 'REFERENCE / WIDE WAKE';
+    $('hint').textContent = 'Final wide view · Replay reference to repeat the camera move';
+    updatePlay();
+  }
+}
+
+function togglePlay() { setPlaying(!state.playing); }
 function updatePlay() {
   $('play').setAttribute('aria-label', state.playing ? 'Pause animation' : 'Play animation');
   $('play').title = state.playing ? 'Pause (Space)' : 'Play (Space)';
   $('play').innerHTML = state.playing ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6v12M16 6v12"/></svg>' : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7Z"/></svg>';
-  $('motion-label').textContent = state.playing ? 'FIELD ACTIVE' : 'FRAME PAUSED';
+  $('motion-label').textContent = reference.loading ? 'LOADING AUDIO' : state.playing ? 'FIELD ACTIVE' : 'FRAME PAUSED';
 }
-function restart() { state.time = 0; state.travel = 0; state.entrance = 0; fluid.reset(); state.playing = true; updatePlay(); }
+function restart() { if (reference.active) { startReference(); return; } state.time = 0; state.travel = 0; state.entrance = 0; fluid.reset(); state.playing = true; updatePlay(); }
 function toggleUI() { state.hidden = !state.hidden; document.body.classList.toggle('ui-hidden', state.hidden); $('show').hidden = !state.hidden; }
 async function toggleFullscreen() {
   try { if (document.fullscreenElement) await document.exitFullscreen(); else await document.documentElement.requestFullscreen(); }
@@ -277,7 +394,12 @@ function drivenTurbulence(travel = state.travel) {
 function render(dt) {
   if (state.view === 'orbit') orbit.update();
   else {
-    if (state.view === 'tracking') {
+    if (state.view === 'reference') {
+      const pose = referenceCameraAt(reference.time);
+      const distance = pose.span / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov/2)) * camera.aspect);
+      desiredPosition.set(pose.x, pose.y + pose.elevation, distance);
+      desiredTarget.set(pose.x, pose.y, 0);
+    } else if (state.view === 'tracking') {
       const mobile = innerWidth < 700;
       const width = mobile ? 125 : 260;
       const distance = width / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov/2)) * camera.aspect);
@@ -292,7 +414,7 @@ function render(dt) {
       desiredPosition.set(4.95, .27, .04);
       desiredTarget.set(-12, .22, 0);
     }
-    const blend = dt > 0 ? 1 - Math.exp(-dt * 3.5) : 1;
+    const blend = state.view !== 'reference' && dt > 0 ? 1 - Math.exp(-dt * 3.5) : 1;
     camera.position.lerp(desiredPosition, blend);
     cameraTarget.lerp(desiredTarget, blend);
     camera.lookAt(cameraTarget);
@@ -323,9 +445,13 @@ function tick(now) {
   const dt = Math.min((now - previous) / 1000, .05); previous = now;
   if (document.hidden) return;
   if (state.playing) {
-    state.time += dt; state.travel += dt * (12 + state.speed * 6);
-    state.entrance = Math.min(1, state.entrance + dt * .65);
-    fluid.update(dt, state.speed, drivenTurbulence());
+    if (reference.active && !reference.finished) {
+      if (!reference.loading) advanceReferenceTo(reference.silent ? reference.time + dt : referenceAudio.ended ? REFERENCE_DURATION : referenceAudio.currentTime);
+    } else {
+      state.time += dt; state.travel += dt * (12 + state.speed * 6);
+      state.entrance = Math.min(1, state.entrance + dt * .65);
+      fluid.update(dt, state.speed, drivenTurbulence());
+    }
   }
   render(dt);
   frames++;

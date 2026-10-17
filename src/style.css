@@ -23,6 +23,16 @@ h1 { font-family: 'Helvetica Neue', sans-serif; font-size: 25px; font-weight: 30
 a { color: var(--muted); text-decoration: none; font-size: 12px; letter-spacing: .02em; }
 a span { margin-left: 5px; }
 #fullscreen { font-size: 25px; color: var(--muted); padding: 7px; }
+.reference-controls { position: absolute; top: 111px; left: 42px; display: flex; align-items: center; gap: 9px; }
+.reference-button { position: relative; display: flex; align-items: center; gap: 11px; padding: 12px 18px 13px 13px; border: 1px solid #7394a04a; background: #061015a6; backdrop-filter: blur(12px); text-align: left; }
+.reference-button > span { display: grid; gap: 5px; }
+.reference-button #reference-action { font-size: 12px; letter-spacing: .025em; }
+.reference-button small { font: 9px Menlo, Consolas, monospace; color: var(--muted); }
+.reference-button svg, .sound-button svg { width: 19px; height: 19px; fill: none; stroke: var(--ice); stroke-width: 1.3; }
+.reference-button .reference-progress { position: absolute; bottom: -1px; left: 0; right: 0; height: 1px; }
+#reference-progress { background: var(--ice); transform: scaleX(0); transform-origin: left; }
+.sound-button { width: 38px; height: 38px; display: grid; place-items: center; }
+.sound-button[aria-pressed='false'] svg { opacity: .35; }
 .scene-caption { position: absolute; left: 43px; bottom: 168px; display: flex; gap: 11px; align-items: center; font: 9px Menlo, Consolas, monospace; letter-spacing: .13em; color: #91abb4; opacity: .72; }
 .live-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--ice); box-shadow: 0 0 8px #9bdde988; }
 .caption-rule { width: 32px; height: 1px; background: #718f9870; margin: 0 3px; }
@@ -76,3 +86,5 @@ kbd { margin-left: 7px; border: 1px solid #647d8744; border-radius: 2px; padding
 }
 
 @media (max-width: 720px) { .segmented { gap: 6px; }.segmented button { font-size: 9px; } }
+@media (max-width: 720px) { .reference-controls { left: 22px; top: 104px; }.reference-button { padding: 10px 13px; } }
+@media (max-height: 540px) and (min-width: 721px) { .reference-controls { top: 85px; }.reference-button { padding: 9px 12px; } }

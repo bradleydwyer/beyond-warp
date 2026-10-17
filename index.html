@@ -16,6 +16,17 @@
         <div class="identity"><span class="insignia" aria-hidden="true"></span><div><h1>BEYOND</h1><p>Warp field study</p></div></div>
         <div class="top-actions"><a href="https://www.youtube.com/watch?v=gCCYWTAA2wQ" target="_blank" rel="noreferrer">Reference <span aria-hidden="true">↗</span></a><button id="fullscreen" title="Fullscreen (F)" aria-label="Fullscreen">⛶</button></div>
       </header>
+      <div class="interface reference-controls">
+        <button id="reference-play" class="reference-button" aria-label="Play reference sequence" title="Replay the reference camera movement with its original audio">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7Z"/></svg>
+          <span><span id="reference-action">Play reference</span><small id="reference-time">Original audio · 4.96 s</small></span>
+          <span class="reference-progress" aria-hidden="true"><span id="reference-progress"></span></span>
+        </button>
+        <button id="reference-sound" class="sound-button" aria-label="Mute reference audio" aria-pressed="true" title="Mute reference audio">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4Z M15 8q4 4 0 8 M18 5q7 7 0 14"/></svg>
+        </button>
+      </div>
+      <audio id="reference-audio" preload="auto"></audio>
       <div class="interface scene-caption"><span class="live-dot"></span><span id="view-label">EXTERIOR / TRACKING</span><span class="caption-rule"></span><span id="motion-label">FIELD ACTIVE</span></div>
       <section class="interface controls" aria-label="Warp controls">
         <div class="transport">
