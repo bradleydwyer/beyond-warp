@@ -2,6 +2,8 @@
 
 A real-time WebGL 2 / Three.js interpretation of the side-on warp bubble in [this Star Trek Beyond clip](https://www.youtube.com/watch?v=gCCYWTAA2wQ).
 
+**Live demo:** https://bradleydwyer.github.io/beyond-warp/ (needs WebGL 2; deployed from `main` by GitHub Actions).
+
 The scene is generated in code: a rounded bow feeding several connected, uneven lobes, background stars that refract through the field, and a small procedural starship. Three appearances are available: luminous fluid, compressed environmental glow, and direct reprojections of the background into three bands. The reference footage is not used by the renderer.
 
 ## Run
