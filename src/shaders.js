@@ -1232,6 +1232,74 @@ float interiorAmount(Section c, vec3 ro, vec3 rd) {
   }
   return amount;
 }
+#ifdef INSIDE_CLEAR
+// Clear view from inside (Effects › Field › Inside clarity). The dark
+// interiors belong to the view from outside: the rim has gathered the light
+// that would have crossed a bubble. A camera inside the field (On board, or
+// Orbit scrolled through the surface) is not looking across its own bubble,
+// only out through its wall, so only what lies beyond that bubble is seen
+// through an interior: another lobe past a neck, or a bubble the ray enters
+// again from outside. main.js compiles this in only while the camera is
+// inside the field and Inside clarity is above 0, so every view from
+// outside, and 0%, are exactly the shaders without it.
+// uInsideClear: x, how much of the own bubble's darkness clears (Inside
+// clarity times the camera's depth weight, 0 at the shell, so crossing the
+// surface does not pop); y, how much of its demagnification eases out (its
+// pull toward the axis is meaningless from inside, where it dragged the
+// whole on-board view off centre); z, how far the bow shock is seen as from
+// inside (1 deep in, 0 at the shell, where the view from outside takes over).
+// uOwnBubble: the x range of the camera's bubble, between the necks either
+// side of it (the bow and the first lobe are one bubble), then the far
+// limits of the bubbles before and after it. uNeckBlend: how far the
+// camera's view takes in the next bubble (x) or the previous one (y) as
+// it nears the neck it shares with it, 1 at the neck. Both sides of a neck
+// then see the two bubbles as one, so moving the camera along the field
+// through a neck (Orbit) hands over smoothly rather than flipping which
+// side counts as beyond.
+uniform vec3 uInsideClear;
+uniform vec4 uOwnBubble;
+uniform vec2 uNeckBlend;
+const float INSIDE_NECK=8.0;
+// 0 inside the camera's own bubble, rising to 1 within INSIDE_NECK units
+// past either neck.
+float pastNeck(float x) {
+  float ahead=mix(smoothstep(uOwnBubble.y,uOwnBubble.y+INSIDE_NECK,x),smoothstep(uOwnBubble.w,uOwnBubble.w+INSIDE_NECK,x),uNeckBlend.x);
+  float behind=mix(1.0-smoothstep(uOwnBubble.x-INSIDE_NECK,uOwnBubble.x,x),1.0-smoothstep(uOwnBubble.z-INSIDE_NECK,uOwnBubble.z,x),uNeckBlend.y);
+  return max(ahead,behind);
+}
+#endif
+// The interior amount a pixel is drawn with: interiorAmount(), or, from
+// inside the field, mixed toward the part of it beyond the camera's own
+// bubble: along the same path samples, a sample counts once the ray has
+// left that bubble, through its wall or past a neck. Each term is
+// continuous in the ray, and the running 'left' is a running maximum of
+// continuous terms, so the picture has no seams; the part beyond is never
+// more than the whole. Both come out of one loop.
+float viewInterior(Section c, vec3 ro, vec3 rd) {
+#ifdef INSIDE_CLEAR
+  float amount=smoothstep(0.0,.25,c.inside)*c.hit*interiorFade(c.entry.x);
+  float beyond=amount*pastNeck(c.entry.x);
+  vec2 span=intersectBox(ro,rd);
+  float t0=max(span.x,0.0),t1=span.y;
+  if (t1>t0) {
+    float left=0.0;
+    for (int k=0;k<10;k++) {
+      vec3 p=ro+rd*mix(t0,t1,(float(k)+.5)/10.0);
+      Shape shape=profile(p.x);
+      float depth=max(shape.size.z,.002);
+      float scale=max((p.y>=0.0?shape.size.x:shape.size.y)/depth,.001);
+      float inside=1.0-length(vec2(p.y/scale,p.z))/depth;
+      float here=smoothstep(0.0,.25,inside)*interiorFade(p.x);
+      left=max(left,max(pastNeck(p.x),1.0-smoothstep(-.15,0.0,inside)));
+      amount=max(amount,here);
+      beyond=max(beyond,here*left);
+    }
+  }
+  return mix(amount,beyond,uInsideClear.x);
+#else
+  return interiorAmount(c,ro,rd);
+#endif
+}
 // Fraction of the light seen through the interior that survives. With the
 // energy-conserving experiment, the loss follows the rim's own brightness.
 float interiorTransmission(Section c, float interior, float fieldLight) {
@@ -1265,6 +1333,9 @@ vec3 interiorView(Section section, vec3 ro, vec3 direction, float interior, floa
 ) {
   float lens=clamp(uLensing/.7,0.0,1.0);
   float shrink=uInteriorShrink*interior*lens;
+#ifdef INSIDE_CLEAR
+  shrink*=1.0-uInsideClear.y;
+#endif
   vec3 outgoing=direction;
   if (shrink>0.0) {
     vec3 axisDirection=normalize(vec3(section.entry.x,0.0,0.0)-ro);
@@ -1274,11 +1345,20 @@ vec3 interiorView(Section section, vec3 ro, vec3 direction, float interior, floa
   }
   // Implicit-derivative lookup in uniform control flow.
   vec3 color=backgroundAlong(outgoing);
+#ifdef INSIDE_CLEAR
+  // From inside, the blur that goes with the demagnification eases out
+  // with it, so the view sharpens continuously rather than at once.
+  float blur=smoothstep(0.0,.3,interior)*(1.0-uInsideClear.y);
+#endif
 #ifdef BOW_DISPERSION
   // Deep in the interior the plain lookup is replaced by the blurred one
   // below, so its own red and blue reads are skipped there (a zero spread;
   // the call stays in uniform control flow for its derivatives).
+#ifdef INSIDE_CLEAR
+  color=disperse(color,outgoing,shrink>0.0 && blur>=1.0 ? vec3(0.0) : bend);
+#else
   color=disperse(color,outgoing,shrink>0.0 && interior>=.3 ? vec3(0.0) : bend);
+#endif
   if (shrink>0.0) {
     float squeeze=1.0+shrink*1.6, level=log2(squeeze)*2.2+1.2;
     vec3 blurred=backgroundAlongLod(outgoing,level);
@@ -1290,12 +1370,20 @@ vec3 interiorView(Section section, vec3 ro, vec3 direction, float interior, floa
       vec3 spread=bend+(outgoing-direction)*BOW_INTERIOR_SPREAD*uBow.x*length(bend)/(length(bend)+.002);
       blurred=vec3(backgroundAlongLod(normalize(outgoing-spread),level).r,blurred.g,backgroundAlongLod(normalize(outgoing+spread),level).b);
     }
+#ifdef INSIDE_CLEAR
+    color=mix(color,blurred,blur);
+#else
     color=mix(color,blurred,smoothstep(0.0,.3,interior));
+#endif
   }
 #else
   if (shrink>0.0) {
     float squeeze=1.0+shrink*1.6;
+#ifdef INSIDE_CLEAR
+    color=mix(color,backgroundAlongLod(outgoing,log2(squeeze)*2.2+1.2),blur);
+#else
     color=mix(color,backgroundAlongLod(outgoing,log2(squeeze)*2.2+1.2),smoothstep(0.0,.3,interior));
+#endif
   }
 #endif
   // The black-level lift is added afterwards, so a fully dark interior still
@@ -1851,6 +1939,11 @@ vec3 gasBehindField(vec3 seen, vec4 front, vec4 back, Section section, float int
   // dark ovals stay dark right up to the lit edge: it reads only at and
   // outside the silhouette, where it is seen edge-on.
   float edgeOn=1.0-.92*smoothstep(0.0,.15,section.inside);
+#ifdef INSIDE_CLEAR
+  // From inside there is no silhouette: the layer just outside the camera's
+  // own wall is seen through that wall, edge-on where the view grazes it.
+  edgeOn=mix(edgeOn,1.0,uInsideClear.x);
+#endif
   float through=throughInterior*edgeOn;
   if (layer) {
     gasAheadLayer=gasShell(front,ambient)*edgeOn;
@@ -1863,9 +1956,21 @@ vec3 gasBehindField(vec3 seen, vec4 front, vec4 back, Section section, float int
   if (bound.y>bound.x) {
     // From inside the field (On board) the whole shock lies beyond the
     // surface and is seen through the interior, like everything ahead.
+#ifdef INSIDE_CLEAR
+    // (Compiled in only while the camera is inside.) Deep inside, the shock
+    // is seen out through the camera's own wall, so it passes the cleared
+    // interior's share. Toward the shell this hands over to the view from
+    // outside, so scrolling through the surface in Orbit does not pop.
+    gasShockLight=gasBowLight(ro,rd,section.hit>0.0 ? dot(section.entry-ro,rd) : 0.0,throughInterior,horizon);
+    if (uInsideClear.z<1.0) {
+      vec3 outside=gasBowLight(ro,rd,section.hit>0.0 ? dot(section.entry-ro,rd) : 1e9,through,horizon);
+      gasShockLight=mix(outside,gasShockLight,uInsideClear.z);
+    }
+#else
     float inside=gasCameraInside(ro);
     float entry=section.hit>0.0 ? dot(section.entry-ro,rd) : (inside>.5 ? 0.0 : 1e9);
     gasShockLight=gasBowLight(ro,rd,entry,inside>.5 ? throughInterior : through,horizon);
+#endif
   }
   return seen;
 }
@@ -2114,7 +2219,7 @@ void main() {
   }
   // Dark, demagnified interiors, as in the compressed appearances.
   Section section=viewSection(ro,originalDirection);
-  float interior=interiorAmount(section,ro,originalDirection);
+  float interior=viewInterior(section,ro,originalDirection);
 #if defined(BOW_DISPERSION) || defined(BOW_LAYERS)
   float rimPixel=2.0*length(rimPoint-ro)/(uProjection[1][1]*uResolution.y);
 #endif
@@ -2648,7 +2753,7 @@ void main() {
   // Dark interiors: the shell gathers light toward its rim, so what is seen
   // through the inside is demagnified and dimmed. The energy-conserving
   // experiment ties the loss to the brightness of the crest above it.
-  float interior=interiorAmount(section,ro,originalDirection);
+  float interior=viewInterior(section,ro,originalDirection);
 #ifdef BOW_LAYERS
   // The sheets lie inside the surface, so pixels whose rays stay clear of it
   // skip them (with a margin over the march's own, slightly coarser

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
+import { REFERENCE_DURATION, referenceCameraAt } from '../src/reference-sequence.js';
+import { FLYBY_DURATION, flybyCameraAt } from '../src/flyby-sequence.js';
+import { FIELD_LENGTH } from '../src/field.js';
 
-const SLIDERS = ['nebula', 'nebulaDensity', 'nebulaGlow', 'blackLevel', 'interior', 'interiorShrink', 'crestThickness', 'crestLight', 'crestVariation',
+const SLIDERS = ['nebula', 'nebulaDensity', 'nebulaGlow', 'blackLevel', 'interior', 'interiorShrink', 'insideClarity', 'crestThickness', 'crestLight', 'crestVariation',
   'gas', 'gasShock', 'gasPileup', 'gasDepth', 'gasFlow',
   'streak', 'streakLength', 'streakTint', 'heroFlares', 'starStreaks',
   'grain', 'softness', 'focus', 'dust', 'grade', 'vignette',
@@ -14,6 +17,10 @@ const BOW_CONTROLS = ['dispersion', 'iridescence', 'bowLayers', 'layerSpread', '
 // The projected stars belong to Compressed space alone, so checkProjection
 // tests them there (and that the other appearances never see them).
 const PROJECTION_CONTROLS = ['projectedStars', 'starThreshold', 'starLayer', 'stableDust'];
+// Inside clarity acts only with the camera inside the field, so checkInside
+// tests it On board and in Orbit (and that every view from outside is
+// untouched) rather than in the wide default still.
+const INSIDE_CONTROLS = ['insideClarity'];
 
 // The Effects panel: every control changes the picture, survives appearance
 // switches and replays, can be set from the URL, and stays deterministic.
@@ -45,7 +52,7 @@ export async function checkEffects(browser, url) {
     for (const id of SLIDERS) {
       const original = await page.locator(`#${id}`).inputValue();
       assert(Number(original) > 0, `${id} should be on by default`);
-      if (BOW_CONTROLS.includes(id) || PROJECTION_CONTROLS.includes(id)) continue;
+      if (BOW_CONTROLS.includes(id) || PROJECTION_CONTROLS.includes(id) || INSIDE_CONTROLS.includes(id)) continue;
       await setRange(id, 0);
       assert.notEqual(await hash(), defaults, `${id} at 0 did not change the frame`);
       await setRange(id, original);
@@ -117,6 +124,290 @@ export async function checkEffects(browser, url) {
   await checkGas(browser, url);
   await checkBow(browser, url);
   await checkProjection(browser, url);
+  await checkInside(browser, url);
+}
+
+// Inside clarity (Effects › Field). On board, the camera sits inside the
+// field and once saw the dark interior over the whole frame; now it looks
+// out through the compression front. In all three appearances the frame is
+// no longer near-black, it is still while paused, it glares no more than
+// the same view with the interiors switched off altogether, and 0% is the
+// near-black frame of a fresh load without it (its define is removed). In
+// motion it adds no flicker over the view with the interiors off. Every
+// view from outside is untouched, and neither camera sequence comes near
+// the inside of the field. Scrolling the Orbit camera in through the
+// surface is continuous: no step jumps much more than the steps either
+// side of it, and the view clears as the camera goes in. So is moving the
+// camera along the field inside it through a neck, from one bubble into
+// the next (also by scrolling out from On board in Orbit). It survives
+// appearance switches and replay, and reads URL parameters.
+export async function checkInside(browser, url) {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 536 } });
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
+  const ready = () => page.waitForFunction(() => window.warp && document.getElementById('loading').hidden);
+  const set = (id, value) => page.locator(`#${id}`).evaluate((el, v) => { el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); }, String(value));
+  // Hash and mean luminance of the whole frame, and with 'stats' its p99 and
+  // p99.9 too.
+  const frame = (stats = false) => page.evaluate(stats => {
+    window.warp.render();
+    const gl = document.querySelector('canvas').getContext('webgl2');
+    const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let hash = 2166136261, sum = 0;
+    const lum = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      hash = Math.imul(hash ^ px[4 * i] ^ (px[4 * i + 1] << 8) ^ (px[4 * i + 2] << 16), 16777619);
+      sum += lum[i] = .2126 * px[4 * i] + .7152 * px[4 * i + 1] + .0722 * px[4 * i + 2];
+    }
+    const result = { hash: hash >>> 0, mean: sum / (w * h), glError: gl.getError() };
+    if (!stats) return result;
+    lum.sort();
+    return { ...result, p99: lum[Math.floor(.99 * (w * h - 1))], p999: lum[Math.floor(.999 * (w * h - 1))] };
+  }, stats);
+  try {
+    // On board, in each appearance (switched in place, as a viewer would).
+    const unlit = {};
+    for (const appearance of ['glow', 'fluid', 'space']) {
+      await page.goto(`${url}/?paused&time=10&view=ride&insideClarity=0&appearance=${appearance}`);
+      await ready();
+      unlit[appearance] = (await frame()).hash;
+    }
+    await page.goto(`${url}/?paused&time=10&view=ride`);
+    await ready();
+    await page.locator('#effects summary').click();
+    const views = {};
+    for (const appearance of ['glow', 'fluid', 'space']) {
+      if (appearance !== 'glow') await page.locator(`[data-appearance="${appearance}"]`).click();
+      const clear = await frame(true);
+      assert.equal(clear.glError, 0);
+      for (let i = 0; i < 3; i++) assert.equal((await frame()).hash, clear.hash, `The on-board view flickers while paused (${appearance})`);
+      await set('insideClarity', 0);
+      const dark = await frame();
+      assert.equal(dark.hash, unlit[appearance], `Inside clarity at 0% is not the frame of a fresh load without it (${appearance})`);
+      await set('insideClarity', .9);
+      assert.equal((await frame()).hash, clear.hash, `Inside clarity did not restore the on-board view exactly (${appearance})`);
+      await set('interior', 0);
+      await set('interiorShrink', 0);
+      const open = await frame(true);
+      await set('interior', .92);
+      await set('interiorShrink', .6);
+      assert(clear.mean > dark.mean * 4 && clear.mean > dark.mean + 20,
+        `The on-board view is still near-black in ${appearance} (mean ${dark.mean.toFixed(1)} -> ${clear.mean.toFixed(1)})`);
+      assert(clear.p99 <= open.p99 + 2 && clear.p999 <= open.p999 + 2,
+        `The cleared on-board view glares in ${appearance} (p99 ${clear.p99.toFixed(0)}, p99.9 ${clear.p999.toFixed(0)} against ${open.p99.toFixed(0)}, ${open.p999.toFixed(0)} with no dark interiors)`);
+      views[appearance] = `${dark.mean.toFixed(1)} -> ${clear.mean.toFixed(1)}`;
+    }
+    // In motion, at fixed steps: paused frames stay identical, and the
+    // cleared view changes from frame to frame no more erratically (mean
+    // absolute second difference) than the same view with no dark interiors.
+    await page.locator('[data-appearance="glow"]').click();
+    const motion = () => page.evaluate(() => {
+      const gl = document.querySelector('canvas').getContext('webgl2');
+      const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight, px = new Uint8Array(w * h * 4);
+      const grab = () => {
+        window.warp.render();
+        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        let hash = 2166136261;
+        const lum = new Float32Array(w * h);
+        for (let i = 0; i < w * h; i++) {
+          hash = Math.imul(hash ^ px[4 * i] ^ (px[4 * i + 1] << 8) ^ (px[4 * i + 2] << 16), 16777619);
+          lum[i] = .2126 * px[4 * i] + .7152 * px[4 * i + 1] + .0722 * px[4 * i + 2];
+        }
+        return { hash: hash >>> 0, lum };
+      };
+      window.warp.seek(10);
+      const frames = [];
+      let still = true;
+      for (let k = 0; k < 8; k++) {
+        window.warp.advance(1 / 60);
+        const a = grab();
+        if (grab().hash !== a.hash) still = false;
+        frames.push(a.lum);
+      }
+      let jitter = 0;
+      for (let k = 2; k < frames.length; k++) for (let i = 0; i < w * h; i++) jitter += Math.abs(frames[k][i] - 2 * frames[k - 1][i] + frames[k - 2][i]);
+      return { still, jitter: jitter / ((frames.length - 2) * w * h) };
+    });
+    const moving = await motion();
+    await set('interior', 0);
+    await set('interiorShrink', 0);
+    const openMoving = await motion();
+    await set('interior', .92);
+    await set('interiorShrink', .6);
+    assert(moving.still, 'On board frames are not identical while paused in motion');
+    assert(moving.jitter <= openMoving.jitter * 1.05 + .2,
+      `The cleared on-board view flickers in motion (second difference ${moving.jitter.toFixed(2)} against ${openMoving.jitter.toFixed(2)} with no dark interiors)`);
+
+    // Views from outside are untouched: the define stays out, and the frame
+    // is the one with the control at 0.
+    for (const [view, appearance] of [['tracking', 'glow'], ['bow', 'space'], ['orbit', 'fluid']]) {
+      await page.evaluate(view => { window.warp.setView(view); window.warp.render(); }, view);
+      await page.locator(`[data-appearance="${appearance}"]`).click();
+      const outside = await frame();
+      assert.equal(await page.evaluate(() => window.warp.insideClear.on), false, `Inside clarity is compiled in for the ${view} view`);
+      await set('insideClarity', 0);
+      assert.equal((await frame()).hash, outside.hash, `Inside clarity changes the ${view} view (${appearance})`);
+      await set('insideClarity', .9);
+    }
+    // Neither camera sequence comes near the inside of the field.
+    const poses = [];
+    for (let i = 0; i <= 300; i++) {
+      for (const pose of [referenceCameraAt(i / 300 * REFERENCE_DURATION), flybyCameraAt(i / 300 * FLYBY_DURATION, 1280 / 536)]) {
+        const distance = pose.span / (2 * Math.tan(39 / 2 * Math.PI / 180) * (1280 / 536));
+        poses.push([pose.x, pose.y + pose.elevation, distance]);
+      }
+    }
+    // (Only poses over the field have a depth; the rest are far outside it.)
+    const over = poses.filter(p => p[0] > 0 && p[0] < FIELD_LENGTH);
+    const deepest = await page.evaluate(poses => Math.max(...poses.map(p => window.warp.insideDepth(...p))), over);
+    assert(deepest < -.5, `A camera sequence comes close to the inside of the field (depth ${deepest.toFixed(2)})`);
+
+    // Orbit, scrolled in through the side of the second bubble: continuous.
+    await page.goto(`${url}/?paused&time=10&view=orbit`);
+    await ready();
+    await page.mouse.move(640, 268);
+    // Each wheel step scales the distance to the target by .95 per 100 of
+    // delta: from 154 to about 33, then 4% at a time to about 15.
+    for (let i = 0; i < 10; i++) await page.mouse.wheel(0, -300);
+    const crossing = [];
+    for (let i = 0; i < 20; i++) {
+      if (i) await page.mouse.wheel(0, -80);
+      // Mean luminance and mean absolute change from the previous step, over
+      // every fourth pixel along both axes.
+      crossing.push(await page.evaluate(() => {
+        window.warp.render();
+        const gl = document.querySelector('canvas').getContext('webgl2');
+        const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+        const px = new Uint8Array(w * h * 4);
+        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        const lum = [];
+        for (let y = 0; y < h; y += 4) for (let x = 0; x < w; x += 4) {
+          const i = (y * w + x) * 4;
+          lum.push(.2126 * px[i] + .7152 * px[i + 1] + .0722 * px[i + 2]);
+        }
+        const before = window.__insideLum;
+        window.__insideLum = lum;
+        let sum = 0, change = 0;
+        for (let i = 0; i < lum.length; i++) { sum += lum[i]; if (before) change += Math.abs(lum[i] - before[i]); }
+        return { mean: sum / lum.length, change: change / lum.length, depth: window.warp.insideClear.depth };
+      }));
+    }
+    const first = crossing[0], last = crossing.at(-1), steps = crossing.slice(1).map(f => f.change);
+    assert(first.depth < 0 && last.depth > .3, `The Orbit scroll did not cross the surface into the bubble (depth ${first.depth.toFixed(2)} -> ${last.depth.toFixed(2)})`);
+    assert(last.mean > first.mean + 15, `The view does not clear inside the bubble in Orbit (mean ${first.mean.toFixed(1)} -> ${last.mean.toFixed(1)})`);
+    for (let i = 1; i < steps.length - 1; i++) {
+      assert(steps[i] <= 2 * Math.max(steps[i - 1], steps[i + 1]) + .5,
+        `Scrolling through the surface pops at step ${i} (mean change ${steps.slice(Math.max(0, i - 2), i + 3).map(v => v.toFixed(2)).join(', ')})`);
+    }
+
+    // Orbit moved along the field inside it, through the neck between the
+    // first two bubbles (Compressed glow and Fluid glow): the camera takes
+    // the next bubble in as its own as it nears the neck, so the view hands
+    // over with no jump. Looking downstream, the bubble ahead clears as the
+    // camera reaches it; looking upstream, the one behind darkens once the
+    // camera has left it.
+    const necks = {};
+    for (const appearance of ['glow', 'fluid']) {
+      await page.goto(`${url}/?paused&time=10&view=orbit&appearance=${appearance}`);
+      await ready();
+      for (const look of [60, -60]) {
+        const rows = await page.evaluate(look => {
+          const lobe = window.warp.fieldShape[0], neck = lobe.center + lobe.halfLength;
+          const gl = document.querySelector('canvas').getContext('webgl2');
+          const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight, px = new Uint8Array(w * h * 4);
+          const rows = [];
+          let before = null;
+          for (let k = -14; k <= 14; k++) {
+            window.warp.setCamera([neck + k, .3, .2], [neck + k + look, .3, .2]);
+            window.warp.render();
+            gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            const lum = [];
+            for (let y = 0; y < h; y += 4) for (let x = 0; x < w; x += 4) {
+              const i = (y * w + x) * 4;
+              lum.push(.2126 * px[i] + .7152 * px[i + 1] + .0722 * px[i + 2]);
+            }
+            let sum = 0, change = 0;
+            for (let i = 0; i < lum.length; i++) { sum += lum[i]; if (before) change += Math.abs(lum[i] - before[i]); }
+            before = lum;
+            const inside = window.warp.insideClear;
+            rows.push({ mean: sum / lum.length, change: change / lum.length, depth: inside.depth, start: inside.bubble[0], glError: gl.getError() });
+          }
+          return rows;
+        }, look);
+        const name = `${appearance} ${look > 0 ? 'downstream' : 'upstream'}`;
+        const first = rows[0], last = rows.at(-1), steps = rows.slice(1).map(f => f.change);
+        assert(rows.every(f => f.glError === 0 && f.depth > .5), `The neck crossing left the inside of the field (${name})`);
+        assert(first.start !== last.start, `The camera did not pass through the neck (${name})`);
+        // (Fluid glow's luminous folds fill most of this view, so the frame's
+        // mean tells the bubbles apart only in Compressed glow.)
+        if (appearance === 'glow' && look > 0) assert(last.mean > first.mean + 10, `Looking downstream, the next bubble does not clear as the camera reaches it (${name}: mean ${first.mean.toFixed(1)} -> ${last.mean.toFixed(1)})`);
+        if (appearance === 'glow' && look < 0) assert(last.mean < first.mean - 10, `Looking upstream, the bubble behind does not darken once the camera has left it (${name}: mean ${first.mean.toFixed(1)} -> ${last.mean.toFixed(1)})`);
+        for (let i = 1; i < steps.length - 1; i++) {
+          assert(steps[i] <= 2 * Math.max(steps[i - 1], steps[i + 1]) + .5,
+            `Moving through a neck pops (${name}) at step ${i} (mean change ${steps.slice(Math.max(0, i - 2), i + 3).map(v => v.toFixed(2)).join(', ')})`);
+        }
+        necks[name] = `${first.mean.toFixed(0)} -> ${last.mean.toFixed(0)}, largest step ${Math.max(...steps).toFixed(2)}`;
+      }
+    }
+    // The same through a viewer's controls: from On board, switch to Orbit
+    // and scroll out, which backs the camera along the axis through the neck.
+    await page.goto(`${url}/?paused&time=10&view=ride`);
+    await ready();
+    await page.locator('[data-view="orbit"]').click();
+    await page.mouse.move(640, 268);
+    // Each 100 of wheel delta scales the distance from the target ahead by
+    // 1/.95: from 17 to about 92 units past it, short of the neck, then 1.3%
+    // (about 1.3 units) a step through it.
+    for (let i = 0; i < 33; i++) await page.mouse.wheel(0, 100);
+    const backing = [];
+    for (let i = 0; i < 22; i++) {
+      if (i) await page.mouse.wheel(0, 25);
+      backing.push(await page.evaluate(() => {
+        window.warp.render();
+        const gl = document.querySelector('canvas').getContext('webgl2');
+        const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+        const px = new Uint8Array(w * h * 4);
+        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        const lum = [];
+        for (let y = 0; y < h; y += 4) for (let x = 0; x < w; x += 4) {
+          const i = (y * w + x) * 4;
+          lum.push(.2126 * px[i] + .7152 * px[i + 1] + .0722 * px[i + 2]);
+        }
+        const before = window.__backingLum;
+        window.__backingLum = lum;
+        let change = 0;
+        for (let i = 0; i < lum.length; i++) if (before) change += Math.abs(lum[i] - before[i]);
+        return { change: change / lum.length, start: window.warp.insideClear.bubble[0], depth: window.warp.insideClear.depth };
+      }));
+    }
+    const backSteps = backing.slice(1).map(f => f.change);
+    assert(backing.every(f => f.depth > .5) && backing[0].start !== backing.at(-1).start,
+      'Scrolling out from On board did not back the camera through the neck inside the field');
+    for (let i = 1; i < backSteps.length - 1; i++) {
+      assert(backSteps[i] <= 2 * Math.max(backSteps[i - 1], backSteps[i + 1]) + .5,
+        `Scrolling out from On board pops at the neck, step ${i} (mean change ${backSteps.slice(Math.max(0, i - 2), i + 3).map(v => v.toFixed(2)).join(', ')})`);
+    }
+
+    // Kept through appearance switches and replay; URL parameters, clamped.
+    await page.goto(`${url}/?paused&time=10&view=ride&insideClarity=0.4`);
+    await ready();
+    assert.equal(await page.locator('#insideClarity').inputValue(), '0.4', 'URL parameter did not set Inside clarity');
+    for (const appearance of ['fluid', 'space', 'glow']) await page.locator(`[data-appearance="${appearance}"]`).click();
+    await page.locator('#reference-play').click();
+    await page.waitForFunction(() => window.warp.reference.time > .1);
+    assert.equal(await page.evaluate(() => window.warp.state.insideClarity), .4, 'Appearance switches or replay reset Inside clarity');
+    await page.evaluate(() => window.warp.pause());
+    await page.goto(`${url}/?paused&time=10&insideClarity=7`);
+    await ready();
+    assert.equal(await page.locator('#insideClarity').inputValue(), '1', 'URL parameter did not clamp Inside clarity');
+    assert.deepEqual(errors, []);
+    console.log(`PASS: on board looks out through the front (mean glow ${views.glow}, fluid ${views.fluid}, space ${views.space}), still while paused, no glare over the view without dark interiors, 0% is the frame without it; in motion second difference ${moving.jitter.toFixed(2)} against ${openMoving.jitter.toFixed(2)}; views from outside untouched, sequences stay outside (deepest ${deepest.toFixed(2)}); Orbit crossing continuous (largest step ${Math.max(...steps).toFixed(2)}, mean ${first.mean.toFixed(0)} -> ${last.mean.toFixed(0)}); through a neck continuous (${Object.entries(necks).map(([k, v]) => `${k} ${v}`).join('; ')}; scrolling out from On board, largest step ${Math.max(...backSteps).toFixed(2)}); kept through switches and replay, URL parameters`);
+  } finally {
+    await page.close();
+  }
 }
 
 // Projected stars (Effects › Projection), in Compressed space: each control

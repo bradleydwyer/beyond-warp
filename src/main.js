@@ -43,7 +43,7 @@ const state = {
 // Values can also be set from the URL, e.g. ?nebula=0&crestThickness=1.5.
 const EFFECTS = {
   nebula: 1, nebulaDensity: 1, nebulaGlow: 1, blackLevel: 1,
-  interior: .92, interiorShrink: .6, crestThickness: 1, crestLight: .85, crestVariation: 1,
+  interior: .92, interiorShrink: .6, insideClarity: .9, crestThickness: 1, crestLight: .85, crestVariation: 1,
   energyRim: true,
   gas: 1, gasShock: 1, gasPileup: 1, gasDepth: 1, gasFlow: 1, gasReacts: true,
   streak: 1, streakLength: .75, streakTint: .8, heroFlares: 1, starStreaks: 1,
@@ -96,6 +96,15 @@ const CENTRE_STAR_SPARSE = .25;
 // little under it (uStarRoom), so a star never tips gas into the bloom.
 const BLOOM_THRESHOLD = .42;
 const STAR_COUNT = 7200, FAR_STAR_COUNT = 1200;
+// Inside clarity (Effects › Field): from inside the field the camera's own
+// bubble no longer darkens the view. It clears over the first INSIDE_DEPTH
+// of the way in from the shell to the axis, so scrolling through the
+// surface in Orbit is continuous; the bubble's demagnification eases out
+// over the first INSIDE_EASE of the slider, and the bow shock hands over
+// to the view from inside over the first INSIDE_HANDOVER. Within
+// INSIDE_NECK_BLEND units of a neck the camera takes the bubble beyond it
+// in as its own, so moving along the field through a neck is continuous too.
+const INSIDE_DEPTH = .3, INSIDE_EASE = .5, INSIDE_HANDOVER = .2, INSIDE_NECK_BLEND = 12;
 // Hero sources: [phase, height, depth, speed, period, size, warmth, brightness].
 // x = mod(phase + travel*speed, period) - period/2, like the stars. The first
 // is placed so the reference camera, unchanged, finds it crossing the rounded
@@ -423,6 +432,7 @@ function init() {
     uProfileSlope: { value: field.derivativeTexture },
     uLensing: { value: state.lensing }, uProjection: { value: camera.projectionMatrix },
     uHeroCaustic: { value: HEROES.map(() => new THREE.Vector4()) },
+    uInsideClear: { value: new THREE.Vector3() }, uOwnBubble: { value: new THREE.Vector4() }, uNeckBlend: { value: new THREE.Vector2() },
     uBow: { value: new THREE.Vector4() }, uFilmFlow: { value: 1 },
     tStarPower: { value: starPowerTarget.texture }, uStarScale: { value: STAR_OVERSCAN }, uProjectedStars: { value: 0 }, uStarLayer: { value: 1 }, uStarSparse: { value: 0 }, uStarPower: starPower.material.uniforms.uStarPower, uStarRoom: { value: BLOOM_THRESHOLD - .02 },
   }, { STEPS: quality[state.quality].steps, HERO_COUNT: HEROES.length });
@@ -483,9 +493,19 @@ function init() {
     get state() { return { ...state, fps, simulationTime: fluid.time }; },
     get fieldShape() { return field.lobes.map(lobe => ({ ...lobe })); },
     get heroes() { return heroReadout.map(hero => ({ ...hero })); },
+    get insideClear() { return { ...insideReadout }; },
+    insideDepth: (x, y, z) => cameraDepth({ x, y, z }),
     get reference() { return { ...reference, duration: REFERENCE_DURATION, audioTime: referenceAudio.currentTime, audioPaused: referenceAudio.paused, camera: camera.position.toArray(), target: cameraTarget.toArray() }; },
     get flyby() { return { ...flyby, duration: FLYBY_DURATION, camera: camera.position.toArray(), target: cameraTarget.toArray() }; },
     setView,
+    // Puts the Orbit camera at an exact pose ([x, y, z] arrays), with no
+    // drag, pan or zoom left to settle, so a path can be stepped exactly.
+    setCamera(position, target) {
+      if (state.view !== 'orbit') setView('orbit');
+      orbit._sphericalDelta.set(0, 0, 0); orbit._panOffset.set(0, 0, 0); orbit._scale = 1;
+      orbit.target.fromArray(target); camera.position.fromArray(position);
+      orbit.update();
+    },
     seek(time) { if (reference.active || flyby.active) setView('tracking'); state.time = time; state.travel = time * spaceVelocity(); state.entrance = 1; fluid.reset(); for (let i=0; i<Math.min(600, Math.round(time*60)); i++) fluid.update(1/60,state.speed,state.turbulence); },
     pause() { setPlaying(false); },
     play() { setPlaying(true); },
@@ -901,6 +921,7 @@ function render(dt) {
   volumeMaterial.uniforms.uEntrance.value = THREE.MathUtils.smoothstep(state.entrance, 0, 1);
   updateBow();
   updateProjectedStars();
+  updateInsideClear();
   lens.uniforms.uTime.value = state.time;
   updateFilm();
   ship.visible = state.ship && state.view !== 'ride';
@@ -966,6 +987,70 @@ function updateProjectedStars() {
   volumeMaterial.uniforms.uStarLayer.value = effectValue('starLayer') ? 1 : 0;
   starPower.material.uniforms.uStarThreshold.value = STAR_THRESHOLD * effectValue('starThreshold');
   volumeMaterial.uniforms.uStarSparse.value = CENTRE_STAR_SPARSE * effectValue('starThreshold');
+}
+
+// Inside clarity (Effects › Field). The dark interiors are the view across a
+// bubble from outside; from inside (On board, or Orbit scrolled through the
+// surface) only what lies beyond the camera's own bubble is seen through an
+// interior. The INSIDE_CLEAR define is compiled in only while the camera is
+// inside the field and the slider is above 0, so every view from outside,
+// and 0%, are exactly the shaders without it (three keeps each compiled
+// variant, so only the first entry compiles). Its strength follows the
+// camera's depth: 1 on the axis, 0 at the shell and negative outside, as
+// the shaders measure it.
+const insideReadout = { depth: -1, weight: 0, on: false, bubble: [0, 0], blend: [0, 0] };
+function cameraDepth(p) {
+  if (!(p.x > 0 && p.x < FIELD_LENGTH)) return -1;
+  let upper, lower, depth;
+  if (p.x < 10) upper = lower = depth = Math.sqrt(Math.max(.00001, 2.7 * p.x));
+  else {
+    const d = field.data, f = p.x / FIELD_LENGTH * 1023, i = Math.min(1022, Math.floor(f)), t = f - i;
+    const at = c => d[i * 4 + c] + (d[i * 4 + 4 + c] - d[i * 4 + c]) * t;
+    upper = at(0); lower = at(1); depth = at(2);
+  }
+  depth = Math.max(depth, .002);
+  const height = Math.max((p.y >= 0 ? upper : lower), .001 * depth);
+  return 1 - Math.hypot(p.y / height, p.z / depth);
+}
+function updateInsideClear() {
+  const clarity = effectValue('insideClarity');
+  const depth = cameraDepth(camera.position);
+  const on = clarity > 0 && depth > 0;
+  const defines = volumeMaterial.defines;
+  if (on !== 'INSIDE_CLEAR' in defines) {
+    if (on) defines.INSIDE_CLEAR = ''; else delete defines.INSIDE_CLEAR;
+    volumeMaterial.needsUpdate = true;
+  }
+  Object.assign(insideReadout, { depth, on, weight: 0, bubble: [0, 0], blend: [0, 0] });
+  if (!on) return;
+  const smooth = THREE.MathUtils.smoothstep;
+  const weight = smooth(depth, 0, INSIDE_DEPTH);
+  // The demagnification eases out fast at first and gently into its end,
+  // so the slider brightens the view evenly, with no kink where it is done
+  // (its light grows fastest as the last of the pull goes). The bow
+  // shock's hand-over at the shell is quicker, so at most slider settings
+  // the surface crossing in Orbit is smooth.
+  const ease = 1 - (1 - Math.min(1, clarity / INSIDE_EASE)) ** 3;
+  const handover = smooth(clarity, 0, INSIDE_HANDOVER);
+  volumeMaterial.uniforms.uInsideClear.value.set(clarity * weight, weight * ease, 1 - (1 - weight) * handover);
+  // The camera's bubble runs between the necks either side of it; the bow
+  // and the first lobe are one bubble, and the last runs on to the tail.
+  // Within INSIDE_NECK_BLEND of a neck the bubble beyond it fades in as
+  // the camera's own too, all of it at the neck, so both sides of the neck
+  // agree and moving through it is continuous.
+  const x = camera.position.x;
+  const necks = field.lobes.slice(0, -1).map(lobe => lobe.center + lobe.halfLength);
+  let i = 0;
+  while (i < necks.length && necks[i] <= x) i++;
+  const neckAt = k => k < 0 ? -1e4 : k >= necks.length ? 1e4 : necks[k];
+  // Short enough that only one neck's hand-over is ever under way.
+  const reach = k => Math.min(INSIDE_NECK_BLEND, .25 * (necks[k] - Math.max(neckAt(k - 1), 0)), .25 * (Math.min(neckAt(k + 1), FIELD_LENGTH) - necks[k]));
+  const start = neckAt(i - 1), end = neckAt(i);
+  const ahead = i < necks.length ? smooth(x, end - reach(i), end) : 0;
+  const behind = i > 0 ? 1 - smooth(x, start, start + reach(i - 1)) : 0;
+  volumeMaterial.uniforms.uOwnBubble.value.set(start, end, neckAt(i - 2), neckAt(i + 1));
+  volumeMaterial.uniforms.uNeckBlend.value.set(ahead, behind);
+  Object.assign(insideReadout, { weight, bubble: [start, end], blend: [ahead, behind] });
 }
 
 // The gas reacts to the field (Effects › Gas). Off (the experiment toggle, or
