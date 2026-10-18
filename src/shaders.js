@@ -55,9 +55,14 @@ uniform mat4 uInverseProjection, uCameraMatrix;
 uniform vec3 uCameraPosition;
 uniform vec4 uDustPhase;
 uniform float uGrain, uSoftness, uFocus, uDust, uGrade, uLetterbox;
-uniform float uFrame, uFocusNear, uDustNear;
+uniform float uFrame, uFocusNear, uDustNear, uDustArea;
 varying vec2 vUv;
 const float FIELD_LENGTH=390.0;
+// Stable dust light: the mip level of the half-resolution blur that each of
+// the nine frame-light taps reads. Its texels are a fortieth of the frame
+// wide, so each bilinear tap averages a patch about a twentieth of the frame
+// across and an eighth of its height.
+const float DUST_AREA_LOD=4.0;
 const vec3 LUMA=vec3(.2126,.7152,.0722);
 
 // Integer hash: the same seed always gives the same grain, so a paused frame
@@ -188,13 +193,17 @@ void main() {
   if (blur>0.0) {
     vec3 soft=(texture2D(tDiffuse,uv+texel*vec2(.5,.75)).rgb+texture2D(tDiffuse,uv+texel*vec2(-.75,.5)).rgb
       +texture2D(tDiffuse,uv+texel*vec2(-.5,-.75)).rgb+texture2D(tDiffuse,uv+texel*vec2(.75,-.5)).rgb)*.25;
-    c=blur<=1.0?mix(c,soft,blur):mix(soft,texture2D(tBlur,uv).rgb,min(blur-1.0,1.0));
+    c=blur<=1.0?mix(c,soft,blur):mix(soft,textureLod(tBlur,uv,0.0).rgb,min(blur-1.0,1.0));
   }
   if (uDust>0.0 && uDustNear>0.0) {
-    // The near gas veils the colours behind it, then adds its own light.
+    // The near gas veils the colours behind it, then adds its own light:
+    // from the space just behind it and, across the frame, nine taps of
+    // the blurred frame. With Stable dust light (uDustArea) each tap is a
+    // broad patch, a coarse mip level, so a bright star dash sliding
+    // through one cannot make the whole frame's dust pulse.
     vec3 frame=vec3(0.0);
-    for (int i=0;i<9;i++) frame+=texture2D(tBlur,vec2(.2+.3*float(i%3),.25+.25*float(i/3))).rgb/9.0;
-    vec4 dust=speedDust(uv,texture2D(tBlur,uv).rgb*.55+frame*.45);
+    for (int i=0;i<9;i++) frame+=textureLod(tBlur,vec2(.2+.3*float(i%3),.25+.25*float(i/3)),uDustArea*DUST_AREA_LOD).rgb/9.0;
+    vec4 dust=speedDust(uv,textureLod(tBlur,uv,0.0).rgb*.55+frame*.45);
     c=mix(c,vec3(dot(c,LUMA)),dust.a)+dust.rgb*(1.0-c);
   }
   if (uGrade>0.0) c=mix(c,grade(c),uGrade);
@@ -917,6 +926,38 @@ void main() {
   float r2 = along * along + p.y * p.y;
   float radiance = exp(-r2 * 16.0) * 1.6 + exp(-r2 * 4.5) * .22;
   gl_FragColor = vec4(vColor * radiance * vGain, 1.0);
+}`;
+
+// Projected stars (Effects › Projection). The world's stars and hero sources
+// alone, with no nebula, are rendered into their own layer with the camera's
+// pose; this pass turns that layer into the fourth power of its light, so
+// that the mipmapped, anisotropically filtered average the field reads back
+// across a band is the mean of the fourth powers there. Its fourth root is a
+// power mean, which keeps a squeezed star close to its own brightness instead
+// of averaging it into the gas (see starColumn() in volumeFragment). The
+// averaging happens on the powers, linearly, so the result changes smoothly
+// as a star slides between texels and nothing pops. Two bilinear taps blur
+// the layer by a pixel across, which keeps the fourth power from beating as
+// a star's core moves between rows; along a band, where the streaks run, it
+// stays pixel-sharp. Stars fainter than the threshold are left out, so the
+// faint ones do not fill the bands with a haze of dots. The layer is 32-bit
+// float where the GPU can filter it; on half float, uStarPower (a scale and
+// a clamp) keeps the powers of faint stars out of the coarse subnormal range
+// (where their colour channels would round off unevenly) and the brightest
+// short of overflow.
+export const starPowerFragment = /* glsl */`
+uniform sampler2D tStars;
+uniform vec2 uStarTexel, uStarPower;
+uniform float uStarThreshold;
+varying vec2 vUv;
+void main() {
+  vec2 dy=vec2(0.0,uStarTexel.y*.5);
+  vec3 s=(texture2D(tStars,vUv-dy).rgb+texture2D(tStars,vUv+dy).rgb)*.5;
+  float level=dot(s,vec3(.2126,.7152,.0722));
+  s*=max(level-uStarThreshold,0.0)/max(level,1e-6);
+  vec3 v=min(s*uStarPower.x,vec3(uStarPower.y));
+  v*=v;
+  gl_FragColor=vec4(v*v,1.0);
 }`;
 
 // The visible view sits inside a larger background capture. A camera-centred
@@ -2191,6 +2232,88 @@ vec3 projectedSpace(float across, float halfWidthPixels) {
   }
   return light/8.0;
 }
+#ifdef PROJECTED_STARS
+// Projected stars (Effects › Projection), read from the separate star layer,
+// which holds the fourth power of the stars' light (see starPowerFragment).
+// Four anisotropic taps average those powers over a band pixel's footprint
+// across the compression, pixel-sharp along it. The footprint is twice the
+// pixel's own height, so a star is always about two pixels tall rather than
+// hopping between one row and two as the band shifts. The fourth root of
+// the mean keeps a star that fills a sixteenth of the footprint at half its
+// brightness (the plain average keeps a sixteenth), so squeezed stars stay
+// bright points and streaks sliding along the band. The layer is the
+// visible frame plus a margin (uStarScale), and a projected band never
+// reads beyond the frame; anything that did would fade out at the margin.
+uniform sampler2D tStarPower;
+// uStarRoom: a little under the bloom's threshold (main.js), which the
+// stars and the gas under them stay below.
+uniform float uStarScale, uProjectedStars, uStarLayer, uStarSparse, uStarRoom;
+uniform vec2 uStarPower;
+// STAR_BARE: how bright a star is where the band has no gas behind it,
+// against one in the gas. STAR_SPARKLE: the light a star may still add
+// over gas that already blooms.
+const float STAR_FOOTPRINT=2.0, STAR_GAIN=12.0, STAR_SHOULDER=2.0, STAR_BARE=.5, STAR_SPARKLE=.03;
+vec3 starColumn(vec2 source, vec2 along, vec2 footprint) {
+  vec2 uv=(source-.5)/uStarScale+.5;
+  along/=uStarScale; footprint*=STAR_FOOTPRINT/uStarScale;
+  vec3 power=vec3(0.0);
+  for (int j=0;j<4;j++) {
+    power+=textureGrad(tStarPower,uv+footprint*((float(j)+.5)/4.0-.5),along,footprint/4.0).rgb;
+  }
+  vec2 edge=min(uv,1.0-uv);
+  return sqrt(sqrt(power*.25))/uStarPower.x*smoothstep(0.0,.03,min(edge.x,edge.y));
+}
+const vec3 STAR_LUMA=vec3(.2126,.7152,.0722);
+// The clip's flecks in the ribbons are blue-white, while the brightest stars
+// are a warm cream; a projected star takes a cool white (unit luminance)
+// and part of the hue of the gas it is squeezed in with.
+const vec3 STAR_COOL=vec3(.70,.93,1.20)/.9012;
+// The stars over a band, before their shoulder (see illuminateBand). Most
+// stars are faint dashes and a few are very bright, so their light is
+// lifted on a square-root curve: the faint ones become visible dashes over
+// the gas without the bright ones being multiplied into glare. The nebula's
+// exposure applies, and they are a little dimmer in the centre stream, as
+// the band itself is. The centre stream squeezes the most sky into the
+// fewest pixels, so it would hold the most stars, nearly a dotted line; a
+// soft threshold there (uStarSparse, which follows Star threshold) leaves
+// its brighter stars as sparse knots, fading the faint ones out smoothly
+// rather than cutting them. 'gas' is the band's own projected light, for
+// the hue. The band repeats a screen column, so where it runs steeply on
+// screen a short dash would be drawn out along it into a long line, racing
+// round the bow or, with Orbit looking down the field, raining down the
+// centre stream, as the star passes; 'lying' fades the stars out there, by
+// the band's direction on screen (starsAlong, set by volumeFragment for
+// each band: along the rim's silhouette; for the centre stream, the lesser
+// of how level the projected axis runs and how upright its normal, the
+// projected vertical, stands: the first fails looking along the field, the
+// second looking down on it from above or below), and only the gas is
+// drawn out.
+// Round the nose the rim curves faster than its own width, so a band pixel
+// can lie on the arc while its closest point on the surface still slopes
+// gently; volumeFragment sets this to fade the rim's stars over the first
+// few units behind the nose (1 for the centre stream).
+vec2 starsAlong=vec2(1.0,0.0);
+float starsBehindNose=1.0;
+// Light added on top of the band after it (the rim's crest), which the
+// stars leave room for under the bloom's threshold.
+float starsOver=0.0;
+// 'reach': how far across the band (in half-widths) it is drawn at all.
+vec3 starBand(float across, float halfWidthPixels, float strength, vec3 gas, float reach, out float lying) {
+  lying=smoothstep(.6,.9,abs(starsAlong.x))*starsBehindNose;
+  if (abs(across)>=reach || lying<=0.0) return vec3(0.0);
+  // The same column as projectedSpace().
+  vec2 source=vec2(vUv.x,.5+clamp(across,-1.0,1.0)*.48);
+  vec3 stars=starColumn(source,vec2(1.0/uResolution.x,0.0),vec2(0.0,.48/max(halfWidthPixels,1.0)));
+  float level=dot(stars,STAR_LUMA);
+  float lifted=sqrt(level)*uProjectedStars*STAR_GAIN*mix(.75,1.0,strength)*spaceExposure();
+  float sparse=(1.0-strength)*uStarSparse;
+  lifted*=lifted*lifted/(lifted*lifted+sparse*sparse+1e-8);
+  vec3 own=stars/max(level,1e-6);
+  vec3 gasHue=gas+STAR_COOL*.002;
+  gasHue/=dot(gasHue,STAR_LUMA);
+  return mix(mix(own,STAR_COOL,.7),gasHue,.25)*lifted;
+}
+#endif
 
 // The floor under the thin edge belongs with the new effects: with the crest
 // and its lighting off, the edge is exactly the original hairline.
@@ -2270,6 +2393,61 @@ vec3 illuminateBand(vec3 base, vec2 screenNormal, vec3 worldNormal,
     // The ribbon is a compressed image of space, never an ink outline: it is
     // not drawn darker than about half of the space just beside it.
     detail=max(detail,under*.55*edgeFloor());
+#ifdef PROJECTED_STARS
+    // Projected stars (Effects › Projection). Edge glow brightens them with
+    // the ribbon (its halo below is the gas's alone). They are drawn mostly
+    // where the band has gas to carry them: over the band's dark stretches
+    // (the bare sky squeezed in beside the crest, the dark side of the
+    // centre stream) they are half as bright, so fewer dashes line the
+    // crest and the dark half of the stream is not crowded. The band's mask
+    // is 0 beyond a half-width (each channel's own, split by Dispersion),
+    // so no stars are read there.
+#ifdef BOW_DISPERSION
+    float starReach=min(1.0+abs(optics.split),1.5);
+#else
+    float starReach=1.0;
+#endif
+    float starLying;
+    vec3 stars=starBand(across,halfWidthPixels,strength,projected,starReach,starLying)*(1.0+edgeGlow*2.0);
+    float gasLevel=dot(detail,STAR_LUMA);
+    stars*=mix(STAR_BARE,1.0,smoothstep(.01,.15,gasLevel));
+    if (uStarLayer<.5) {
+      // Separate star layer off (the experiment): the stars join the gas and
+      // pass through the ribbon's own shoulder, floor and tint with it.
+      detail=bandLight(projected+stars*(starLying/(gain*(1.0+edgeGlow*2.0))),gain*(1.0+edgeGlow*2.0))*shade;
+#ifdef BOW_FILM
+      detail*=optics.tint;
+#endif
+      detail=max(detail,under*.55*edgeFloor());
+    } else {
+      // A layer of their own, on top, after the floor, so bright gas behind
+      // a band (the floor's per-channel max) cannot swallow part of their
+      // colour. The key light dims them less than the gas, so the shaded
+      // lower rim keeps its stars. A shoulder of their own holds the
+      // brightest to about half the scene's white, and they give way as the
+      // band nears the bloom's threshold, so a star stays a crisp point
+      // rather than flaring into a round glint. The bloom takes a pixel's
+      // whole light once it passes the threshold, so a star must not lift
+      // gas just under it across: the room closes there, on purpose, before
+      // gas that already blooms (well past it) gets back a faint sparkle,
+      // which only adds its own little light to the bloom. The crest's light,
+      // added on top of the rim afterwards (starsOver), counts as gas here:
+      // stars crossing its key-lit hot spot made the hot spot's halo pulse.
+      vec3 starLight=stars*sqrt(shade);
+      starLight/=1.0+dot(starLight,STAR_LUMA)*STAR_SHOULDER;
+      float below=gasLevel+starsOver;
+      float room=max(uStarRoom-below,0.0)+STAR_SPARKLE*smoothstep(uStarRoom+.04,uStarRoom+.16,below);
+      // A soft minimum of the star and the room left (a 4-norm): a star well
+      // inside the room is untouched.
+      float fill=dot(starLight,STAR_LUMA)/max(room,1e-4);
+      fill*=fill;
+      starLight*=starLying*inversesqrt(sqrt(1.0+fill*fill));
+#ifdef BOW_FILM
+      starLight*=optics.tint;
+#endif
+      detail+=starLight;
+    }
+#endif
     vec3 color=mix(base,detail,mask*visibility);
     if (edgeGlow>0.0) {
       // Bloom only the projected outer ribbons. The five samples integrate
@@ -2511,6 +2689,18 @@ void main() {
   // floor also follows the unbent view of the space behind the edge: against
   // bright gas the edge never reads as an ink outline.
   vec3 under=max(color,backgroundAlong(originalDirection)*.9);
+#ifdef PROJECTED_STARS
+  starsAlong=vec2(normal.y,-normal.x);
+  starsBehindNose=smoothstep(3.0,10.0,rimPoint.x);
+  // The crest's light lands on top of the rim after it (the same light,
+  // computed first), so the stars leave room for it under the bloom.
+  vec3 crest=vec3(0.0);
+  if (uCrestThickness>0.0 && section.front>0.0) {
+    float crestFade=smoothstep(-.5,1.0,section.entry.x)*tailFade(section.entry.x);
+    crest=crestLight(section,worldPixel,crestKey(section.side.y),patches,crestFade);
+  }
+  starsOver=dot(crest,STAR_LUMA);
+#endif
 #ifdef BOW_BAND_OPTICS
   BandOptics rimOptics=plainBand();
 #ifdef BOW_DISPERSION
@@ -2531,10 +2721,15 @@ void main() {
 #else
   color=illuminateBand(color,normal,rimNormal,across,width/worldPixel,fade,1.0,uEdgeGlow,edgeShade,1.0-.65*min(uCrestThickness,1.0),under);
 #endif
+#ifdef PROJECTED_STARS
+  color+=crest;
+  starsOver=0.0;
+#else
   if (uCrestThickness>0.0 && section.front>0.0) {
     float crestFade=smoothstep(-.5,1.0,section.entry.x)*tailFade(section.entry.x);
     color+=crestLight(section,worldPixel,crestKey(section.side.y),patches,crestFade);
   }
+#endif
 #ifdef BOW_LAYERS
   color+=bowLayers(sheets,sheetClosest,sheetPoint,normal,worldPixel,uBandGlow>.5 ? 60.0 : 34.0);
 #endif
@@ -2562,6 +2757,17 @@ void main() {
   // broader, softer centre stream in gradually behind it.
   float centerFade=smoothstep(6.2,8.5,axis.x)*tailFade(axis.x);
   centerFade*=1.0-smoothstep(.85,.98,abs(originalDirection.x));
+#ifdef PROJECTED_STARS
+  // The stream lies flat only where both its run (the projected axis) is
+  // level and its across direction (axisNormal, the projected vertical) is
+  // upright. Looking along the axis the first fails; looking down on the
+  // field from steeply above or below, the second does: axisNormal turns
+  // radial, the lines of equal 'across' run down the screen, and each star
+  // would be stretched into a vertical bar.
+  starsAlong=normalize((projectPosition(axis+vec3(1.0,0.0,0.0))-axisUv)*uResolution+vec2(.00001));
+  starsAlong=vec2(min(abs(starsAlong.x),abs(axisNormal.y)),0.0);
+  starsBehindNose=1.0;
+#endif
 #ifdef BOW_BAND_OPTICS
   color=illuminateBand(color,axisNormal,vec3(0.0,1.0,0.0),centerAcross,halfWidth,centerFade,.38,0.0,1.0,1.0,color,plainBand());
 #else

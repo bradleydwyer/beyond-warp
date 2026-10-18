@@ -10,9 +10,12 @@ import { fullscreenVertex, filmBlurFragment, filmFragment } from './shaders.js';
 export class FilmPass extends Pass {
   constructor(uniforms) {
     super();
-    const target = () => new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: false });
+    const target = options => new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: false, ...options });
     this.first = target();
-    this.blurred = target();
+    // Mipmapped for Stable dust light, which reads the frame's light for the
+    // speed dust over broad patches (see filmFragment). Every other read is
+    // of its full-resolution level, exactly as without the mipmaps.
+    this.blurred = target({ minFilter: THREE.LinearMipmapLinearFilter, generateMipmaps: true });
     this.blurMaterial = new THREE.ShaderMaterial({
       uniforms: { tDiffuse: { value: null }, uStep: { value: new THREE.Vector2() } },
       vertexShader: fullscreenVertex, fragmentShader: filmBlurFragment, depthTest: false, depthWrite: false,

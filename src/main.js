@@ -6,7 +6,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
-import { fullscreenVertex, backgroundFragment, starVertex, starFragment, heroVertex, heroFragment, volumeFragment, fluidVolumeFragment, lensFragment } from './shaders.js';
+import { fullscreenVertex, backgroundFragment, starVertex, starFragment, heroVertex, heroFragment, starPowerFragment, volumeFragment, fluidVolumeFragment, lensFragment } from './shaders.js';
 import { StreakBloomPass, HeroFlashPass } from './streak.js';
 import { createShip } from './ship.js';
 import { FilmPass } from './film.js';
@@ -49,6 +49,7 @@ const EFFECTS = {
   streak: 1, streakLength: .75, streakTint: .8, heroFlares: 1, starStreaks: 1,
   grain: 1, softness: 1, focus: 1, dust: 1, grade: 1, vignette: 1, letterbox: true,
   dispersion: 1, iridescence: 1, bowLayers: 1, layerSpread: 1, filmFlow: true, layerRefraction: true,
+  projectedStars: 1, starThreshold: 1, starLayer: true, stableDust: true,
 };
 const EFFECT_SLIDERS = Object.keys(EFFECTS).filter(key => typeof EFFECTS[key] === 'number');
 const EFFECT_TOGGLES = Object.keys(EFFECTS).filter(key => typeof EFFECTS[key] === 'boolean');
@@ -79,6 +80,21 @@ let gasFlow, gasOn = false;
 const gasMaterials = [];
 let sceneCamera, offscreenTarget, offscreenCamera, offscreenKey = '';
 const SCENE_OVERSCAN = 1.8;
+// Projected stars (Effects › Projection): a layer of the stars alone, at the
+// camera's pose. A projected band only ever reads the visible frame, so the
+// layer covers that plus a small margin rather than the scene's 1.8× view.
+const STAR_OVERSCAN = 1.25;
+let starTarget, starPowerTarget, starCamera, starPower, starLayerOn = false;
+const fullscreenCamera = new THREE.Camera();
+// The star layer's luminance below which a star is left out, at Star
+// threshold 100%: most of the faintest stars.
+const STAR_THRESHOLD = .015;
+// The centre stream's soft threshold on its projected stars' brightness at
+// Star threshold 100%, which thins its crowd of faint dashes to sparse knots.
+const CENTRE_STAR_SPARSE = .25;
+// UnrealBloom's luminance threshold. The projected stars keep the bands a
+// little under it (uStarRoom), so a star never tips gas into the bloom.
+const BLOOM_THRESHOLD = .42;
 const STAR_COUNT = 7200, FAR_STAR_COUNT = 1200;
 // Hero sources: [phase, height, depth, speed, period, size, warmth, brightness].
 // x = mod(phase + travel*speed, period) - period/2, like the stars. The first
@@ -372,6 +388,22 @@ function init() {
 
   sceneTarget = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: true, depthBuffer: true, samples: 4 });
   sceneTarget.texture.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
+  // The star layer; its fourth power is mipmapped for the band's footprint.
+  // It is not multisampled: the stars are soft additive sprites whose light
+  // is already filtered over a pixel (see starFragment), so multisampling
+  // changed no pixel of the bands by more than a few levels, at the cost of
+  // a large multisampled buffer.
+  starTarget = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false, depthBuffer: false });
+  // 32-bit float where it can be filtered: the fourth powers of faint and
+  // bright stars span far more than half float's range. ?halfFloatStars
+  // forces the half-float path (scaled and clamped, see starPowerFragment)
+  // that GPUs without filterable 32-bit float get, so it can be tested.
+  const fullFloat = renderer.extensions.has('OES_texture_float_linear') && renderer.extensions.has('EXT_color_buffer_float') && !params.has('halfFloatStars');
+  starPowerTarget = new THREE.WebGLRenderTarget(1, 1, { type: fullFloat ? THREE.FloatType : THREE.HalfFloatType, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: true, depthBuffer: false });
+  starPowerTarget.texture.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
+  starCamera = camera.clone();
+  const starPowerScale = { value: fullFloat ? new THREE.Vector2(4, 1000) : new THREE.Vector2(20, 15) };
+  starPower = makeFullscreenScene(starPowerFragment, { tStars: { value: starTarget.texture }, uStarTexel: { value: new THREE.Vector2(1, 1) }, uStarThreshold: { value: 0 }, uStarPower: starPowerScale });
   const volume = makeFullscreenScene(state.appearance === 'fluid' ? fluidVolumeFragment : volumeFragment, {
     ...shared,
     tScene: { value: sceneTarget.texture },
@@ -392,6 +424,7 @@ function init() {
     uLensing: { value: state.lensing }, uProjection: { value: camera.projectionMatrix },
     uHeroCaustic: { value: HEROES.map(() => new THREE.Vector4()) },
     uBow: { value: new THREE.Vector4() }, uFilmFlow: { value: 1 },
+    tStarPower: { value: starPowerTarget.texture }, uStarScale: { value: STAR_OVERSCAN }, uProjectedStars: { value: 0 }, uStarLayer: { value: 1 }, uStarSparse: { value: 0 }, uStarPower: starPower.material.uniforms.uStarPower, uStarRoom: { value: BLOOM_THRESHOLD - .02 },
   }, { STEPS: quality[state.quality].steps, HERO_COUNT: HEROES.length });
   composite = volume.scene; volumeMaterial = volume.material;
   gasMaterials.push(volumeMaterial);
@@ -408,7 +441,7 @@ function init() {
   composer.addPass(heroFlash);
   streak = new StreakBloomPass();
   composer.addPass(streak);
-  bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), state.bloom, .72, .42);
+  bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), state.bloom, .72, BLOOM_THRESHOLD);
   composer.addPass(bloom);
   lens = new ShaderPass({ uniforms: {
     tDiffuse: { value: null }, uTime: shared.uTime, uResolution: shared.uResolution, uBloom: { value: state.bloom },
@@ -429,6 +462,7 @@ function init() {
     uInverseProjection: { value: camera.projectionMatrixInverse }, uCameraMatrix: { value: camera.matrixWorld }, uCameraPosition: { value: camera.position },
     uGrain: { value: 0 }, uSoftness: { value: 0 }, uFocus: { value: 0 }, uDust: { value: 0 }, uGrade: { value: 0 }, uLetterbox: { value: 0 },
     uFrame: { value: 0 }, uFocusNear: { value: 0 }, uDustNear: { value: 0 }, uDustPhase: { value: new THREE.Vector4() }, uDustFlow: { value: new THREE.Vector2() },
+    uDustArea: { value: 0 },
   });
   composer.addPass(film);
 
@@ -486,6 +520,11 @@ function resize() {
   composer.setPixelRatio(pixelRatio); composer.setSize(width, height);
   const sceneRatio = pixelRatio * SCENE_OVERSCAN * Math.min(1, 3072/(width*pixelRatio*SCENE_OVERSCAN));
   sceneTarget.setSize(Math.floor(width * sceneRatio), Math.floor(height * sceneRatio));
+  const starRatio = pixelRatio * STAR_OVERSCAN * Math.min(1, 3072/(width*pixelRatio*STAR_OVERSCAN));
+  const starWidth = Math.floor(width * starRatio), starHeight = Math.floor(height * starRatio);
+  starTarget.setSize(starWidth, starHeight);
+  starPowerTarget.setSize(starWidth, starHeight);
+  starPower.material.uniforms.uStarTexel.value.set(1 / starWidth, 1 / starHeight);
   shared.uResolution.value.set(width * pixelRatio, height * pixelRatio);
   fxaa.uniforms.resolution.value.set(1/(width*pixelRatio),1/(height*pixelRatio));
   camera.aspect = width / height;
@@ -861,6 +900,7 @@ function render(dt) {
   volumeMaterial.uniforms.uLensing.value = state.lensing;
   volumeMaterial.uniforms.uEntrance.value = THREE.MathUtils.smoothstep(state.entrance, 0, 1);
   updateBow();
+  updateProjectedStars();
   lens.uniforms.uTime.value = state.time;
   updateFilm();
   ship.visible = state.ship && state.view !== 'ride';
@@ -883,8 +923,49 @@ function render(dt) {
   renderer.setRenderTarget(sceneTarget); renderer.clear();
   renderer.render(background, new THREE.Camera());
   renderer.clearDepth(); renderer.render(world, sceneCamera);
+  // With no field the bands are not drawn, so the layer is not needed.
+  if (starLayerOn && state.intensity > 0) {
+    // The stars alone (the world scene holds only the stars, far stars and
+    // hero sources), then the fourth power of their light, mipmapped.
+    starCamera.copy(camera, false);
+    starCamera.projectionMatrix.elements[0] /= STAR_OVERSCAN;
+    starCamera.projectionMatrix.elements[5] /= STAR_OVERSCAN;
+    starCamera.projectionMatrixInverse.copy(starCamera.projectionMatrix).invert();
+    // Only what the field reprojects: the stars' cores and shutter trails and
+    // the hero sources. The anamorphic line and the soft halo are the
+    // camera lens's, added to the stars after the field, and the far stars
+    // are static single-pixel specks that would only speckle the bands.
+    const streak = starUniforms.uStarStreak.value, halo = starUniforms.uBloom.value;
+    starUniforms.uStarStreak.value = 0; starUniforms.uBloom.value = 0; farStars.visible = false;
+    renderer.setRenderTarget(starTarget); renderer.clear();
+    renderer.render(world, starCamera);
+    starUniforms.uStarStreak.value = streak; starUniforms.uBloom.value = halo; farStars.visible = true;
+    renderer.setRenderTarget(starPowerTarget);
+    renderer.render(starPower.scene, fullscreenCamera);
+  }
   renderer.setRenderTarget(null);
   composer.render();
+}
+
+// Projected stars (Effects › Projection). Compressed space only: at 0% the
+// PROJECTED_STARS define is removed and the star layer is not drawn, so the
+// frame is exactly the one without it, and the other appearances never see it.
+function updateProjectedStars() {
+  const gain = effectValue('projectedStars');
+  const on = gain > 0 && state.appearance === 'space';
+  const defines = volumeMaterial.defines;
+  if (on !== 'PROJECTED_STARS' in defines) {
+    if (on) defines.PROJECTED_STARS = ''; else delete defines.PROJECTED_STARS;
+    volumeMaterial.needsUpdate = true;
+  }
+  // Leaving it (another appearance, or 0%) frees the layer's GPU memory; it
+  // is allocated again on its next use.
+  if (starLayerOn && !on) { starTarget.dispose(); starPowerTarget.dispose(); }
+  starLayerOn = on;
+  volumeMaterial.uniforms.uProjectedStars.value = gain;
+  volumeMaterial.uniforms.uStarLayer.value = effectValue('starLayer') ? 1 : 0;
+  starPower.material.uniforms.uStarThreshold.value = STAR_THRESHOLD * effectValue('starThreshold');
+  volumeMaterial.uniforms.uStarSparse.value = CENTRE_STAR_SPARSE * effectValue('starThreshold');
 }
 
 // The gas reacts to the field (Effects › Gas). Off (the experiment toggle, or
@@ -958,6 +1039,13 @@ function updateFilm() {
   u.uFocusNear.value = 1/(1 + (distance/45)**2);
   u.uDustNear.value = 1/(1 + (distance/35)**2);
   for (let i = 0; i < 4; i++) u.uDustPhase.value.setComponent(i, (state.travel*DUST_RATES[i]) % 64);
+  // Stable dust light (Experiments): the dust's light from the whole frame
+  // is read over broad patches instead of nine single points, so a
+  // projected star sliding through one of them no longer makes all the dust
+  // pulse. Only with Projected stars in Compressed space (which slide
+  // through those points several times a second); everywhere else the dust
+  // is exactly as before.
+  u.uDustArea.value = starLayerOn && effectValue('stableDust') ? 1 : 0;
   // The on-screen direction space streams past: camera right/up against +x.
   u.uDustFlow.value.set(camera.matrixWorld.elements[0], camera.matrixWorld.elements[4]);
   film.enabled = u.uGrain.value > 0 || u.uSoftness.value > 0 || u.uFocus.value > 0 || u.uDust.value > 0

@@ -4,13 +4,16 @@ const SLIDERS = ['nebula', 'nebulaDensity', 'nebulaGlow', 'blackLevel', 'interio
   'gas', 'gasShock', 'gasPileup', 'gasDepth', 'gasFlow',
   'streak', 'streakLength', 'streakTint', 'heroFlares', 'starStreaks',
   'grain', 'softness', 'focus', 'dust', 'grade', 'vignette',
-  'dispersion', 'iridescence', 'bowLayers', 'layerSpread'];
+  'dispersion', 'iridescence', 'bowLayers', 'layerSpread', 'projectedStars', 'starThreshold'];
 // Experiments (checkboxes that are on by default).
-const TOGGLES = ['energyRim', 'gasReacts', 'filmFlow', 'layerRefraction'];
+const TOGGLES = ['energyRim', 'gasReacts', 'filmFlow', 'layerRefraction', 'starLayer', 'stableDust'];
 // The bow's optics act at the bow and hand over to the plain rim as the
 // camera pulls back, so checkBow tests them in the Bow camera (and that they
 // leave the wide shot's nose alone) rather than in the wide default still.
 const BOW_CONTROLS = ['dispersion', 'iridescence', 'bowLayers', 'layerSpread', 'filmFlow', 'layerRefraction'];
+// The projected stars belong to Compressed space alone, so checkProjection
+// tests them there (and that the other appearances never see them).
+const PROJECTION_CONTROLS = ['projectedStars', 'starThreshold', 'starLayer', 'stableDust'];
 
 // The Effects panel: every control changes the picture, survives appearance
 // switches and replays, can be set from the URL, and stays deterministic.
@@ -42,14 +45,14 @@ export async function checkEffects(browser, url) {
     for (const id of SLIDERS) {
       const original = await page.locator(`#${id}`).inputValue();
       assert(Number(original) > 0, `${id} should be on by default`);
-      if (BOW_CONTROLS.includes(id)) continue;
+      if (BOW_CONTROLS.includes(id) || PROJECTION_CONTROLS.includes(id)) continue;
       await setRange(id, 0);
       assert.notEqual(await hash(), defaults, `${id} at 0 did not change the frame`);
       await setRange(id, original);
     }
     for (const id of TOGGLES) {
       assert(await page.locator(`#${id}`).isChecked(), `${id} should be on by default`);
-      if (BOW_CONTROLS.includes(id)) continue;
+      if (BOW_CONTROLS.includes(id) || PROJECTION_CONTROLS.includes(id)) continue;
       await page.locator(`#${id}`).uncheck();
       assert.notEqual(await hash(), defaults, `${id} toggle did not change the frame`);
       await page.locator(`#${id}`).check();
@@ -113,6 +116,228 @@ export async function checkEffects(browser, url) {
   await checkFilm(browser, url);
   await checkGas(browser, url);
   await checkBow(browser, url);
+  await checkProjection(browser, url);
+}
+
+// Projected stars (Effects › Projection), in Compressed space: each control
+// changes the bands and restores them exactly, the frame is still while
+// paused (also after the stars have moved on), 0% is the same frame as a
+// fresh load without it (its define is removed and the star layer is not
+// drawn), and Compressed glow and Fluid glow never see it. The stars in the
+// centre stream stand out: along its rows there are many more points
+// standing well above the local median of the band, and they stand further
+// above it; a higher Star threshold leaves fewer of them. They are sparse
+// points, not glare: most of the stream is the gas as before, and the
+// frame's mean and its brightest pixels hardly rise. Edge glow keeps
+// working with them. Looking down on the field from above (Orbit dragged to
+// the pole) the centre stream's stars are not stretched into vertical bars.
+// In the Bow camera, a star sliding along the centre stream does not make
+// the whole frame's speed dust pulse (Stable dust light), which the other
+// appearances never see. The controls survive appearance switches and
+// replay, and read URL parameters.
+export async function checkProjection(browser, url) {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 536 } });
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
+  const ready = () => page.waitForFunction(() => window.warp && document.getElementById('loading').hidden);
+  const set = (id, value) => page.locator(`#${id}`).evaluate((el, v) => {
+    if (el.type === 'checkbox') { el.checked = v === 'true'; el.dispatchEvent(new Event('change', { bubbles: true })); }
+    else { el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); }
+  }, String(value));
+  // Hash, the frame's mean and p99.9 luminance, and the peaks: local maxima
+  // along a row standing more than 24 levels above the median of the 31
+  // pixels around them, over the whole frame (the sky's own stars are the
+  // same with and without, so the difference is the bands' stars) and along
+  // the rows of the centre stream (the field's axis is the middle row in the
+  // wide view). 'stream' is those rows' luminance.
+  const frame = () => page.evaluate(() => {
+    window.warp.render();
+    const gl = document.querySelector('canvas').getContext('webgl2');
+    const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let hash = 2166136261;
+    for (let i = 0; i < px.length; i += 16) hash = Math.imul(hash ^ px[i] ^ (px[i + 1] << 8) ^ (px[i + 2] << 16), 16777619);
+    const lum = (x, y) => { const i = ((h - 1 - y) * w + x) * 4; return .2126 * px[i] + .7152 * px[i + 1] + .0722 * px[i + 2]; };
+    const all = new Float32Array(w * h);
+    let sum = 0;
+    for (let i = 0; i < w * h; i++) sum += all[i] = .2126 * px[4 * i] + .7152 * px[4 * i + 1] + .0722 * px[4 * i + 2];
+    all.sort();
+    const peakAt = (x, y) => {
+      const v = lum(x, y);
+      if (v < lum(x - 1, y) || v < lum(x - 2, y) || v <= lum(x + 1, y) || v <= lum(x + 2, y)) return 0;
+      const around = [];
+      for (let d = -15; d <= 15; d++) around.push(lum(x + d, y));
+      around.sort((a, b) => a - b);
+      return v - around[15] > 24 ? v - around[15] : 0;
+    };
+    let peaks = 0, strong = 0, streamPeaks = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 15; x < w - 15; x++) {
+        const e = peakAt(x, y);
+        if (e) peaks++;
+        if (e > 40) strong++;
+      }
+    }
+    const stream = [];
+    for (let y = Math.round(.47 * h); y <= Math.round(.53 * h); y++) {
+      for (let x = Math.round(.1 * w); x < Math.round(.95 * w); x++) {
+        stream.push(lum(x, y));
+        if (peakAt(x, y)) streamPeaks++;
+      }
+    }
+    return { hash: hash >>> 0, peaks, strong, streamPeaks, mean: sum / (w * h), p999: all[Math.floor(.999 * (all.length - 1))], stream };
+  });
+  const shot = async query => { await page.goto(`${url}/?paused&time=10&${query}`); await ready(); return frame(); };
+  try {
+    const on = await shot('appearance=space');
+    for (let i = 0; i < 3; i++) assert.equal((await frame()).hash, on.hash, 'The projected stars flicker while paused');
+    await page.locator('#effects summary').click();
+    for (const id of PROJECTION_CONTROLS) {
+      const toggle = await page.locator(`#${id}`).evaluate(el => el.type === 'checkbox');
+      const original = toggle ? 'true' : await page.locator(`#${id}`).inputValue();
+      assert(toggle ? await page.locator(`#${id}`).isChecked() : Number(original) > 0, `${id} should be on by default`);
+      await set(id, toggle ? 'false' : 0);
+      assert.notEqual((await frame()).hash, on.hash, `${id} off did not change the Compressed space bands`);
+      await set(id, original);
+      assert.equal((await frame()).hash, on.hash, `${id} did not restore the bands exactly`);
+    }
+    await set('projectedStars', 0);
+    const off = await frame();
+    // Sparse points over the gas, not speckle or glare.
+    let brightened = 0;
+    for (let i = 0; i < on.stream.length; i++) if (on.stream[i] > off.stream[i] + 16) brightened++;
+    const speckle = brightened / on.stream.length;
+    assert(speckle < .3, `The centre stream fills with speckle (${(speckle * 100).toFixed(0)}% of it brightened by more than 16 levels)`);
+    assert(on.mean < off.mean + 5, `Projected stars brighten the whole frame (mean ${off.mean.toFixed(1)} -> ${on.mean.toFixed(1)})`);
+    assert(on.p999 < off.p999 + 30, `Projected stars glare (p99.9 ${off.p999.toFixed(0)} -> ${on.p999.toFixed(0)})`);
+    await set('starThreshold', 2);
+    const sparse = await frame();
+    await set('projectedStars', 1);
+    const strict = await frame();
+    assert(on.peaks >= off.peaks + 80 && on.strong >= off.strong + 40 && on.streamPeaks >= off.streamPeaks + 8,
+      `The projected stars do not stand out in the bands (${off.peaks} -> ${on.peaks} peaks, ${off.strong} -> ${on.strong} standing 40 levels out; centre stream ${off.streamPeaks} -> ${on.streamPeaks})`);
+    assert(strict.peaks < on.peaks, `A higher Star threshold did not leave fewer stars (${on.peaks} -> ${strict.peaks})`);
+    assert.equal(sparse.hash, off.hash, 'Star threshold changes the frame with Projected stars at 0%');
+    assert.equal((await shot('appearance=space&projectedStars=0')).hash, off.hash, 'Projected stars at 0% is not the frame without them');
+    // The half-float star layer (GPUs without filterable 32-bit float) shows
+    // the same stars, still while paused.
+    const half = await shot('appearance=space&halfFloatStars');
+    assert(half.peaks >= off.peaks + 80 && half.strong >= off.strong + 40 && Math.abs(half.peaks - on.peaks) < .1 * on.peaks,
+      `The half-float star layer differs (${on.peaks} -> ${half.peaks} peaks, ${on.strong} -> ${half.strong} standing out)`);
+    assert.equal((await frame()).hash, half.hash, 'The half-float star layer is not still while paused');
+    // Still while paused after the stars have moved on.
+    await shot('appearance=space');
+    await page.evaluate(() => window.warp.advance(10 / 60));
+    const moved = await frame();
+    assert.notEqual(moved.hash, on.hash, 'The frame did not advance');
+    for (let i = 0; i < 2; i++) assert.equal((await frame()).hash, moved.hash, 'The projected stars are not still while paused');
+    // Edge glow brightens the ribbons and their stars; the stars still
+    // change the frame there and it is still while paused.
+    await page.locator('#edgeGlow').evaluate(el => { el.value = '1'; el.dispatchEvent(new Event('input', { bubbles: true })); });
+    const glowing = await frame();
+    assert.notEqual(glowing.hash, moved.hash, 'Edge glow did not change Compressed space');
+    assert.equal((await frame()).hash, glowing.hash, 'Edge glow with projected stars is not still while paused');
+    await page.locator('#effects summary').click();
+    await set('projectedStars', 0);
+    assert.notEqual((await frame()).hash, glowing.hash, 'Projected stars do not show with Edge glow on');
+    // The other appearances never see them, nor Stable dust light (the
+    // dust is strongest in the Bow camera).
+    for (const appearance of ['glow', 'fluid']) {
+      const plain = await shot(`appearance=${appearance}&projectedStars=0`);
+      assert.equal((await shot(`appearance=${appearance}&projectedStars=3&starThreshold=0`)).hash, plain.hash, `Projected stars change ${appearance}`);
+      const bow = await shot(`appearance=${appearance}&view=bow&stableDust=0`);
+      assert.equal((await shot(`appearance=${appearance}&view=bow`)).hash, bow.hash, `Stable dust light changes ${appearance}`);
+    }
+    // Lengths of vertical runs: the luminance of the frame now against the
+    // one kept by the previous call ('keep'), in columns where it rose by
+    // more than 25 levels for 12 rows or more.
+    const lumFrame = keep => page.evaluate(keep => {
+      window.warp.render();
+      const gl = document.querySelector('canvas').getContext('webgl2');
+      const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+      const px = new Uint8Array(w * h * 4);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      const lum = new Float32Array(w * h);
+      for (let i = 0; i < w * h; i++) lum[i] = .2126 * px[4 * i] + .7152 * px[4 * i + 1] + .0722 * px[4 * i + 2];
+      const before = window.__projectionLum;
+      if (keep) window.__projectionLum = lum;
+      if (!before || keep) return { w, h };
+      let bars = 0, lowerLeft = 0;
+      for (let x = 0; x < w; x++) {
+        let run = 0, longest = 0;
+        for (let y = 0; y < h; y++) {
+          const d = before[y * w + x] - lum[y * w + x];
+          if (d > 25) longest = Math.max(longest, ++run); else run = 0;
+          // GL rows run bottom up: y < .45h is the lower part of the frame.
+          if (x < w / 2 && y < .45 * h && d > 2) lowerLeft += d;
+        }
+        if (longest >= 12) bars++;
+      }
+      return { w, h, bars, lowerLeft };
+    }, keep);
+    // Orbit from straight above: a long vertical drag parks the camera at
+    // the pole, where the stream's across direction turns radial.
+    await page.goto(`${url}/?paused&time=10&appearance=space&view=orbit`);
+    await ready();
+    await page.evaluate(() => document.getElementById('hide')?.click());
+    await page.mouse.move(640, 268);
+    await page.mouse.down();
+    await page.mouse.move(640, 468, { steps: 25 });
+    await page.mouse.up();
+    let pose = '';
+    for (let i = 0; i < 300; i++) {
+      const now = await page.evaluate(() => { window.warp.render(); return JSON.stringify(window.warp.reference.camera.map(v => v.toFixed(4))); });
+      if (now === pose) break;
+      pose = now;
+    }
+    const camera = JSON.parse(pose).map(Number);
+    assert(Math.abs(camera[1]) > 150 && Math.abs(camera[2]) < 1, `The Orbit drag did not reach the pole (${pose})`);
+    await lumFrame(true);
+    await set('projectedStars', 0);
+    const pole = await lumFrame(false);
+    assert(pole.bars <= 3, `Seen from above, the centre stream's stars are stretched into vertical bars (${pole.bars} columns)`);
+    // Bow camera: a dash on the centre stream crossed one of the dust's
+    // nine frame-light points in these frames and lit all the dust for a
+    // few frames. Stars at a ten-thousandth keep the star layer and the dust
+    // light it brings, so only the stars differ.
+    const setFine = (id, value) => page.locator(`#${id}`).evaluate((el, v) => {
+      el.step = 'any'; el.value = v; el.dispatchEvent(new Event('input', { bubbles: true }));
+    }, String(value));
+    await page.goto(`${url}/?paused&time=10&appearance=space&view=bow`);
+    await ready();
+    await page.evaluate(() => { window.warp.seek(10); window.warp.advance(2); for (let i = 0; i < 4; i++) window.warp.advance(1 / 60); });
+    let pulse = 0;
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => window.warp.advance(1 / 60));
+      await setFine('projectedStars', 1);
+      await lumFrame(true);
+      await setFine('projectedStars', .0001);
+      pulse = Math.max(pulse, (await lumFrame(false)).lowerLeft);
+    }
+    assert(pulse < 10000, `Projected stars make the Bow camera's speed dust pulse (${Math.round(pulse)} levels of light in the lower left)`);
+    // Kept through appearance switches and replay; URL parameters, clamped.
+    await shot('appearance=space');
+    await page.locator('#effects summary').click();
+    await set('projectedStars', 1.7);
+    await set('starThreshold', .4);
+    for (const appearance of ['fluid', 'glow', 'space']) await page.locator(`[data-appearance="${appearance}"]`).click();
+    await page.locator('#reference-play').click();
+    await page.waitForFunction(() => window.warp.reference.time > .1);
+    assert.deepEqual(await page.evaluate(() => [window.warp.state.projectedStars, window.warp.state.starThreshold, window.warp.state.appearance]), [1.7, .4, 'space'],
+      'Appearance switches or replay reset the projection controls');
+    await page.evaluate(() => window.warp.pause());
+    await page.goto(`${url}/?paused&time=10&appearance=space&projectedStars=9&starThreshold=0.5&starLayer=0`);
+    await ready();
+    assert.equal(await page.locator('#starLayer').isChecked(), false, 'URL parameter did not set Separate star layer');
+    assert.equal(await page.locator('#projectedStars').inputValue(), '3', 'URL parameter did not set (and clamp) Projected stars');
+    assert.equal(await page.locator('#starThreshold').inputValue(), '0.5', 'URL parameter did not set Star threshold');
+    assert.deepEqual(errors, []);
+    console.log(`PASS: projected stars change the Compressed space bands and restore exactly, still while paused, 0% is the frame without them, glow and fluid untouched, Edge glow works with them, no bars seen from above (${pole.bars} columns), no dust pulse in the Bow camera (${Math.round(pulse)}); peaks ${off.peaks} -> ${on.peaks} (${off.strong} -> ${on.strong} standing 40 levels out), centre stream ${off.streamPeaks} -> ${on.streamPeaks} (${(speckle * 100).toFixed(0)}% of it brightened), ${strict.peaks} at Star threshold 200%; frame mean ${off.mean.toFixed(1)} -> ${on.mean.toFixed(1)}, p99.9 ${off.p999.toFixed(0)} -> ${on.p999.toFixed(0)}`);
+  } finally {
+    await page.close();
+  }
 }
 
 // The bow close-up (Effects › Bow), in the Bow camera: every Bow control
