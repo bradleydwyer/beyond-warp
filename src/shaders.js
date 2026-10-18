@@ -968,6 +968,73 @@ vec3 backgroundAlongLod(vec3 direction,float level) {
 }
 `;
 
+// The bow close-up (Effects › Bow): colour dispersion, soap-film colours on
+// the glass and nested arcs at the nose. Each part is compiled in only while
+// its control is above 0 (BOW_DISPERSION, BOW_FILM, BOW_LAYERS, and
+// BOW_LAYER_LENS for the Layered refraction experiment), so with the controls
+// at 0 the shaders are exactly the earlier ones. uBow is (dispersion,
+// iridescence, layer strength, layer spread).
+const bowRefraction = /* glsl */`
+#if defined(BOW_DISPERSION) || defined(BOW_FILM) || defined(BOW_LAYERS)
+uniform vec4 uBow;
+uniform float uFilmFlow;
+// 1 round the nose, falling to 0 along the first flanks.
+float bowNose(float x) { return 1.0-smoothstep(6.0,70.0,x); }
+// The colour fringes are a length on the field, not a pixel count: full size
+// (about a pixel) in the bow close-ups, where a pixel at the nose covers
+// under BOW_FRINGE_WORLD units, and shrinking below a pixel as the camera
+// pulls back, so the wide and orbit shots get no red/blue outline.
+const float BOW_FRINGE_WORLD=.032, BOW_INTERIOR_SPREAD=.012;
+float bowFringeScale(float worldPixel) { return min(1.0,BOW_FRINGE_WORLD/max(worldPixel,1e-4)); }
+#endif
+#ifdef BOW_DISPERSION
+// Dispersion: red is bent a little less than green and blue a little more, so
+// whatever the lens bends breaks into colour fringes where it bends most (at
+// the rim, and most of all round the nose). bowDispersion() gives the ray's
+// whole bend times that red/blue spread, or 0 where the fringe would be under
+// about a fifth of a pixel; each volume shader passes it to interiorView()
+// after its march. Where the nose folds the view through a large angle the
+// fringe saturates softly at a few pixels (times the slider), so the folded
+// image gets coloured edges rather than splitting into separate red and blue
+// copies. Downstream both the strength and that limit fall to about a third,
+// and with distance the limit follows bowFringeScale(), so the hairline lens
+// ring along the wide shot's crest is not tinted.
+vec3 bowDispersion(vec3 bent, vec3 straight, float x, float worldPixel) {
+  float nose=bowNose(x);
+  vec3 bend=(bent-straight)*uBow.x*.16*mix(.35,1.0,nose);
+  float pixel=2.0/(uProjection[1][1]*uResolution.y);
+  float cap=pixel*mix(1.5,3.5,nose)*uBow.x*bowFringeScale(worldPixel);
+  bend*=cap/sqrt(dot(bend,bend)+cap*cap);
+  return dot(bend,bend)>pixel*pixel*.04 ? bend : vec3(0.0);
+}
+vec3 backgroundAlongGrad(vec3 direction, vec2 gx, vec2 gy) {
+  vec3 view=vec3(dot(direction,uCameraMatrix[0].xyz),dot(direction,uCameraMatrix[1].xyz),dot(direction,uCameraMatrix[2].xyz));
+  if (view.z>=-.05) return textureLod(uOffscreenScene,direction,0.0).rgb;
+  vec4 projected=uProjection*vec4(view,0.0);
+  vec2 uv=projected.xy/projected.w*.5+.5;
+  vec2 capture=sceneUv(uv);
+  vec3 wide=textureGrad(tScene,clamp(capture,vec2(.001),vec2(.999)),gx,gy).rgb;
+  vec3 beyond=textureLod(uOffscreenScene,sceneRay(uv),0.0).rgb;
+  return mix(beyond,wide,sceneCoverage(capture));
+}
+// 'color' is the plain lookup along 'outgoing'. Red and blue are read again
+// along the less and the more bent ray, with twice the plain lookup's filter
+// footprint (its derivatives are taken here, in uniform control flow): a
+// spectrum spreads continuously, so a bright streak gets soft colour fringes
+// rather than three crisp primary-coloured copies.
+vec3 disperse(vec3 color, vec3 outgoing, vec3 bend) {
+  vec3 view=vec3(dot(outgoing,uCameraMatrix[0].xyz),dot(outgoing,uCameraMatrix[1].xyz),dot(outgoing,uCameraMatrix[2].xyz));
+  vec4 projected=uProjection*vec4(view,0.0);
+  vec2 capture=sceneUv(projected.xy/max(abs(projected.w),1e-4)*.5+.5);
+  vec2 gx=dFdx(capture)*2.0, gy=dFdy(capture)*2.0;
+  if (bend==vec3(0.0)) return color;
+  vec3 red=backgroundAlongGrad(normalize(outgoing-bend),gx,gy);
+  vec3 blue=backgroundAlongGrad(normalize(outgoing+bend),gx,gy);
+  return vec3(red.r,color.g,blue.b);
+}
+#endif
+`;
+
 // Crest and interior helpers shared by the field appearances. All of their
 // texture comes from the transported fluid dye, so it streams downstream with
 // the flow. Included after profile() and displacement().
@@ -1149,7 +1216,12 @@ float interiorTransmission(Section c, float interior, float fieldLight) {
 // to match, and dimmed. Both follow Light bending: at 0% the bubble no longer
 // bends light away from its interior, so the dark ovals go too. The darkening
 // stops at the deep-blue black level instead of crushing it to pure black.
-vec3 interiorView(Section section, vec3 ro, vec3 direction, float interior, float fieldLight) {
+// With Dispersion on, 'bend' is the colour spread from bowDispersion().
+vec3 interiorView(Section section, vec3 ro, vec3 direction, float interior, float fieldLight
+#ifdef BOW_DISPERSION
+  , vec3 bend
+#endif
+) {
   float lens=clamp(uLensing/.7,0.0,1.0);
   float shrink=uInteriorShrink*interior*lens;
   vec3 outgoing=direction;
@@ -1161,10 +1233,30 @@ vec3 interiorView(Section section, vec3 ro, vec3 direction, float interior, floa
   }
   // Implicit-derivative lookup in uniform control flow.
   vec3 color=backgroundAlong(outgoing);
+#ifdef BOW_DISPERSION
+  // Deep in the interior the plain lookup is replaced by the blurred one
+  // below, so its own red and blue reads are skipped there (a zero spread;
+  // the call stays in uniform control flow for its derivatives).
+  color=disperse(color,outgoing,shrink>0.0 && interior>=.3 ? vec3(0.0) : bend);
+  if (shrink>0.0) {
+    float squeeze=1.0+shrink*1.6, level=log2(squeeze)*2.2+1.2;
+    vec3 blurred=backgroundAlongLod(outgoing,level);
+    // The blurred, demagnified view through the bow splits the same way, a
+    // little wider (the demagnification is a lens too), so bright gas seen
+    // through the glass picks up soft red and green patches; mixing in the
+    // plain blur would wash the fringe out wherever the interior shrinks.
+    if (bend!=vec3(0.0)) {
+      vec3 spread=bend+(outgoing-direction)*BOW_INTERIOR_SPREAD*uBow.x*length(bend)/(length(bend)+.002);
+      blurred=vec3(backgroundAlongLod(normalize(outgoing-spread),level).r,blurred.g,backgroundAlongLod(normalize(outgoing+spread),level).b);
+    }
+    color=mix(color,blurred,smoothstep(0.0,.3,interior));
+  }
+#else
   if (shrink>0.0) {
     float squeeze=1.0+shrink*1.6;
     color=mix(color,backgroundAlongLod(outgoing,log2(squeeze)*2.2+1.2),smoothstep(0.0,.3,interior));
   }
+#endif
   // The black-level lift is added afterwards, so a fully dark interior still
   // stops at deep blue rather than crushing to pure black.
   return color*interiorTransmission(section,interior,fieldLight*lens);
@@ -1186,6 +1278,332 @@ vec3 skyAverage() {
   return skyCache;
 }
 float spaceExposure() { skyAverage(); return exposureCache; }
+`;
+
+// The bow's glass (Effects › Bow), shared by the three appearances. Included
+// after fieldEffects, before fieldCrest.
+const bowSurface = /* glsl */`
+#if defined(BOW_FILM) || defined(BOW_LAYERS)
+// The box-filtered (64×32) dye read with smoothed, C1 interpolation across
+// its texels: plain bilinear taps kinked the arcs whose depth follows the dye
+// into a polyline, and cut the film's colour patches into straight-edged
+// blocks, at every texel boundary.
+vec3 bowPatch(vec2 uv) {
+  vec2 size=vec2(textureSize(uFluidPatches,0));
+  vec2 texel=uv*size-.5;
+  vec2 cell=floor(texel), f=fract(texel);
+  vec2 smoothUv=(cell+.5+f*f*(3.0-2.0*f))/size;
+  return texture2D(uFluidPatches,vec2(clamp(smoothUv.x,.001,.999),fract(smoothUv.y))).rgb;
+}
+// The box-filtered dye at a silhouette point (fluid coordinates sideUv),
+// 'turn' of the way further round the shell. It streams downstream with the
+// flow (at the nose the full-resolution dye moves tens of pixels a frame,
+// which would strobe). Seen from the side, the silhouette's angle round the
+// shell flips from the top to the bottom at the nose's centre line, so the two
+// sides are blended there: nothing the dye drives is cut by a seam.
+vec3 bowDye(vec2 sideUv, float turn, float vertical) {
+  vec3 own=bowPatch(vec2(sideUv.x,sideUv.y+turn));
+  float blend=.5-.5*smoothstep(0.0,.4,abs(vertical));
+  return blend>0.0 ? mix(own,bowPatch(vec2(sideUv.x,sideUv.y+turn+.5)),blend) : own;
+}
+#endif
+#ifdef BOW_FILM
+// Soap-film colours as a cosine palette kept to the half of the hue wheel the
+// clip shows: 0 cyan, 1/6 green, 1/3 amber, 1/2 red (never magenta or violet),
+// scaled to unit luminance so it recolours the glass without brightening it.
+vec3 filmColour(float hue) {
+  vec3 tint=1.0+.5*cos(6.2831853*hue+vec3(3.1415927,-1.0471976,1.0471976));
+  return tint/dot(tint,vec3(.2126,.7152,.0722));
+}
+// The full-resolution dye at a silhouette point, blended across the nose's
+// centre line like bowDye. (The fluid texture has no mipmaps.)
+vec3 bowFineDye(vec2 sideUv, float turn, float vertical) {
+  vec3 own=textureLod(uFluid,vec2(sideUv.x,fract(sideUv.y+turn)),0.0).rgb;
+  float blend=.5-.5*smoothstep(0.0,.4,abs(vertical));
+  return blend>0.0 ? mix(own,textureLod(uFluid,vec2(sideUv.x,fract(sideUv.y+turn+.5)),0.0).rgb,blend) : own;
+}
+// The tint the film gives the light the glass reflects at a point of the
+// shell (fluid coordinates uv). The film's thickness, and so its hue, is
+// carried by the fluid dye, so the colours swirl and stream downstream with
+// the flow; the dye gathers them into patches, so most of the glass stays
+// blue-white with colour here and there. 'order' picks a different hue for
+// each nested sheet; a grazing view shortens the path through the film, so
+// the hue also shifts across the rim. With Fluid-driven film thickness off
+// the hue depends only on those two. Strongest round the nose, faint
+// downstream. Where one texel of the full-resolution dye spans several pixels
+// (round the nose in the close-ups) its swirls are mixed in; farther out they
+// would alias, and the box-filtered copy alone is used.
+vec3 filmTint(vec2 uv, float vertical, float grazing, float x, float order, float strength, float worldPixel) {
+  float flow=0.0, patchy=.55;
+  if (uFilmFlow>.5) {
+    vec3 broad=bowDye(uv,order*.11,vertical);
+    float detail=smoothstep(2.0,6.0,(LENGTH/512.0)/max(worldPixel,1e-4));
+    vec3 dye=detail>0.0 ? mix(broad,bowFineDye(uv,order*.11,vertical),detail) : broad;
+    // Blobs addressed only by the transported dye (like the crest's clumps),
+    // so they too travel downstream with the flow.
+    float blobs=smoothNoise(vec3(dye.r*9.0,dye.b*9.0,broad.g*6.0+order*1.7));
+    flow=(broad.r-.40)*2.0+(dye.b-.50)*4.0+blobs*.9;
+    patchy=smoothstep(.30,.70,dye.r*.45+blobs*.65);
+  }
+  float hue=.20+.30*sin(6.2831853*(flow*.38+order*.23+grazing*.18));
+  // Fainter as the camera pulls back: a trace in the wide shot's crest.
+  float amount=uBow.y*strength*mix(.30,1.0,bowNose(x))*(.10+.90*patchy*patchy)*mix(.40,1.0,bowFringeScale(worldPixel));
+  return mix(vec3(1.0),filmColour(hue),clamp(amount,0.0,.95));
+}
+#endif
+#ifdef BOW_LAYERS
+// Nested sheets of glass at the bow: iso-surfaces a share of the way from the
+// surface to the axis along the surface's normal (for the paraboloid nose
+// that length is sqrt(BOW_NOSE²+radius²): the nose's own radius of curvature
+// at the tip, about the radius along the flanks), so they stay nested round
+// the tip and fan out from the nose like the clip's arcs. The share decays
+// downstream (by e every BOW_CONVERGE units), so the sheets converge into the
+// rim and crest. They lie inside the surface; the bow-shock gas stands
+// outside it.
+//
+// The sheets are unevenly spaced and not quite concentric: each is a little
+// deeper on one side of the nose than the other (a share of its depth along
+// the outward normal's component in these directions), so round the flanks
+// neighbouring arcs drift together and apart and hook, while at the very tip
+// of the nose (normal along the axis) they stay nested. However far Layer
+// spread and the flow's ripples push a sheet, it eases off below BOW_DEEPEST
+// of the way to the axis and fades out as it nears that: a sheet reaching the
+// axis folded its silhouette into scribbles and washed the interior.
+const vec3 BOW_SHEETS=vec3(1.15,1.85,3.3), BOW_LEVEL=vec3(.42,.32,.24), BOW_WIDTH=vec3(.85,1.35,1.9);
+const float BOW_SPREAD=.15, BOW_NOSE=1.35, BOW_CONVERGE=40.0, BOW_DEEPEST=.55, BOW_SHEET_LENS=.10, BOW_GLASS=.40, BOW_GLASS_GRAIN=5.0;
+const vec3 BOW_TILT0=vec3(0.0,.24,.12), BOW_TILT1=vec3(0.0,-.26,.10), BOW_TILT2=vec3(0.0,.16,-.24);
+// The profile with its slopes eased from the paraboloid nose's into the
+// chain's over x 10 to 16. They meet at x=10 with a step in slope, and the
+// distance estimate deep under the surface follows the slope, so the deep
+// sheets stepped by several pixels at a fixed place on screen.
+Shape bowProfile(float x) {
+  Shape shape=profile(x);
+  float cap=1.0-smoothstep(10.0,16.0,x);
+  if (x>=10.0 && cap>0.0) shape.slope.xyz=mix(shape.slope.xyz,vec3(1.35/sqrt(2.7*x)),cap);
+  return shape;
+}
+// The march's distance with the slopes eased as in bowProfile(), from the
+// loop's own terms (it differs only from x 10 to 16), to pick the sample
+// where each ray passes deepest under the surface: with the step in slope, a
+// ray seen a little obliquely could pass deepest on either side of x=10, and
+// where the pick switched, the dye and tilt read there jumped, cutting the
+// arcs and the film along a ragged line.
+float sheetDistance(float baseDistance, float implicitDistance, vec3 gradient, float heightSlope, vec4 slope, float y, float scale, float depth, float height, float x) {
+  if (x<10.0 || x>=16.0) return baseDistance;
+  float cap=1.0-smoothstep(10.0,16.0,x), nose=1.35/sqrt(2.7*x);
+  float hs=mix(heightSlope,nose,cap), zs=mix(slope.z,nose,cap);
+  float scaleSlope=(hs*depth-height*zs)/(depth*depth);
+  gradient.x=-2.0*y*slope.w/(scale*scale)-2.0*y*y*scaleSlope/(scale*scale*scale)-2.0*depth*zs;
+  return implicitDistance/max(length(gradient),.001);
+}
+// The march's signed distance to the surface (as in the loop, with the eased
+// slopes), and its minimum along the ray refined by a parabola through the
+// closest sample and its neighbours one step either way. Deep inside the
+// field the march steps are long, and the arcs drawn at the raw sampled
+// minimum broke into overlapping, offset segments like scales.
+float fieldDistance(vec3 p) {
+  Shape shape=bowProfile(p.x);
+  float depth=max(shape.size.z,.002);
+  bool upper=p.y>=shape.size.w;
+  float height=upper?shape.size.x:shape.size.y;
+  float heightSlope=upper?shape.slope.x:shape.slope.y;
+  float scale=height/depth;
+  float scaleSlope=(heightSlope*depth-height*shape.slope.z)/(depth*depth);
+  float y=p.y-shape.size.w;
+  vec2 radial=vec2(y/max(scale,.001),p.z);
+  vec3 gradient=vec3(-2.0*y*shape.slope.w/(scale*scale)-2.0*y*y*scaleSlope/(scale*scale*scale)-2.0*depth*shape.slope.z,2.0*y/(scale*scale),2.0*p.z);
+  float implicitDistance=dot(radial,radial)-depth*depth;
+  if (p.x<10.0) { implicitDistance=dot(p.yz,p.yz)-2.7*p.x; gradient=vec3(-2.7,2.0*p.y,2.0*p.z); }
+  if (p.x>=uTailCap.x) {
+    vec3 radii=vec3(uTailCap.y-uTailCap.x,p.y>=0.0?uTailCap.z:uTailCap.w,(uTailCap.z+uTailCap.w)*.5);
+    vec3 q=(p-vec3(uTailCap.x,0.0,0.0))/radii;
+    implicitDistance=dot(q,q)-1.0;
+    gradient=2.0*q/radii;
+  }
+  return implicitDistance/max(length(gradient),.001);
+}
+// Returns the refined minimum; 'point' (the march's deepest sample) moves to
+// where it lies. Two rounds, so the minimum is found even a step or two from
+// the sample (the steps are long deep inside the field, and a sample on the
+// wrong side of the nose's join at x=10 kinked the deep arcs there). All the
+// samples use fieldDistance(), so the result is as smooth as it is.
+float refinedClosest(inout vec3 point, vec3 direction, float step) {
+  float closest=fieldDistance(point);
+  for (int k=0;k<2;k++) {
+    float before=fieldDistance(point-direction*step), after=fieldDistance(point+direction*step);
+    float curve=before-2.0*closest+after;
+    if (curve<=1e-5) break;
+    float shift=clamp(.5*(before-after)/curve,-1.0,1.0);
+    point+=direction*shift*step;
+    closest=k==0 ? fieldDistance(point) : min(closest,closest+.5*(after-before)*shift+.5*curve*shift*shift);
+  }
+  return closest;
+}
+// Where each sheet is for this pixel: 'offset' is how far under the surface
+// each lies at the ray's deepest point (so the ray grazes sheet k where
+// closest+offset[k] is 0), rippled by the flow; 'weight' is how much of it
+// shows; 'stretch' is the dye that breaks it into bright stretches and gaps;
+// 'uv' and 'vertical' are the fluid coordinates of the silhouette line at
+// that deepest point and its height on its side of the axis (-1 to 1), for
+// the dye there. 'normal' is the outward normal of the surface's
+// cross-section there, its radial part scaled by how far out from the axis
+// the point lies: smooth from pixel to pixel (the normal at the march's
+// closest sample jumps as the sample changes, which broke the arcs into
+// segments) and through the axis, where a unit radial direction would flip.
+struct BowSheets { vec3 offset; vec3 weight; vec3 stretch; vec2 uv; float vertical; vec3 normal; };
+// Whether any sheet can show for this pixel at all (the fades in bowSheets():
+// the hand-over to the rim as the camera pulls back, the fade downstream and
+// the fade away from side-on), so the rest of the field skips them.
+bool bowSheetsShow(float x, float worldPixel) { return worldPixel<.12 && x<70.0 && abs(uCameraMatrix[2].x)<.6; }
+BowSheets noSheets() { BowSheets s; s.offset=vec3(1.0); s.weight=vec3(0.0); s.stretch=vec3(0.0); s.uv=vec2(0.0); s.vertical=0.0; s.normal=vec3(0.0,1.0,0.0); return s; }
+BowSheets bowSheets(float closest, vec3 point, float worldPixel, float fade) {
+  BowSheets s;
+  float x=max(point.x,0.0);
+  Shape shape=bowProfile(point.x);
+  bool upper=point.y>=shape.size.w;
+  float radius=upper ? shape.size.x : shape.size.y;
+  // The dye and the tilt are read on the silhouette line above (or below)
+  // that point, not round the shell at the point itself: seen a little
+  // obliquely, a ray can pass deepest on either side of the silhouette, and
+  // where the deepest point switched sides the dye and tilt read there
+  // jumped, cutting the arcs and the film along a ragged line. (Across the
+  // nose's centre line bowDye() blends the two sides half and half, so the
+  // switch from top to bottom there is seamless.)
+  s.uv=vec2(clamp(point.x/LENGTH,.001,.999),upper ? .5 : 0.0);
+  s.vertical=clamp((point.y-shape.size.w)/max(radius,.001),-1.0,1.0);
+  float slope=upper ? shape.slope.x : shape.slope.y;
+  s.normal=vec3(-slope,s.vertical,0.0)/sqrt(1.0+slope*slope);
+  vec3 tilt=1.0+vec3(dot(s.normal,BOW_TILT0),dot(s.normal,BOW_TILT1),dot(s.normal,BOW_TILT2));
+  float reach=sqrt(BOW_NOSE*BOW_NOSE+radius*radius);
+  vec3 share=BOW_SHEETS*tilt*uBow.w*BOW_SPREAD*exp(-x/BOW_CONVERGE)/BOW_DEEPEST;
+  vec3 eased;
+  // The flow ripples the sheets as it does the surface: each is pushed in and
+  // out by the (smoothed, box-filtered) dye where the ray grazes it, a share
+  // of its depth, so the arcs waver apart and together, hook, and the waves
+  // travel downstream. (The dye at the pixel's own nearest approach to the
+  // axis changes across the arcs in perspective, and broke them into scales.)
+  for (int k=0;k<3;k++) {
+    vec3 d=bowDye(s.uv,.17*float(k)+.05,s.vertical);
+    s.stretch[k]=d.r*.8+d.g*.2;
+    float f=max(share[k]*(1.0+displacement(d)*.85*uTurbulence/1.5),0.0);
+    // A soft limit: shallow sheets pass almost unchanged, deep ones ease
+    // toward BOW_DEEPEST of the way to the axis.
+    eased[k]=f/sqrt(sqrt(1.0+f*f*f*f));
+    s.offset[k]=eased[k]*BOW_DEEPEST*reach;
+  }
+  // A sheet shows where it stands clear of the rim by a few pixels; closer,
+  // it has merged into the rim. As the camera pulls back (a pixel at the nose
+  // growing from about 0.075 to 0.12 units, from about 2.5 s to 3 s of the
+  // reference move) the sheets hand over to the rim altogether, so they are
+  // still several arcs round the 2 s flash and the wide shot's crest keeps a
+  // single edge. They also fade near the depth limit, the deeper ones sooner
+  // downstream (so the deepest is not a wire along the bubble), and as the
+  // camera turns away from side-on (in Orbit, where the inner sheets'
+  // silhouettes would wander through the interior).
+  float sideOn=abs(uCameraMatrix[2].x);
+  vec3 shown=(1.0-smoothstep(vec3(6.0),vec3(70.0,55.0,36.0),vec3(x)))
+    *(1.0-smoothstep(vec3(.30,.24,.18),vec3(.60,.50,.40),vec3(sideOn)))
+    *(1.0-smoothstep(.82,.97,eased));
+  s.weight=smoothstep(1.5,4.5,s.offset/worldPixel)*shown*fade*(1.0-smoothstep(.075,.12,worldPixel));
+  return s;
+}
+#ifdef BOW_LAYER_LENS
+// Layered refraction (experiment): each sheet is a thin lens ring of its own
+// that pulls the rays passing close to it toward itself, so the space behind
+// the nose is gathered into each arc and parted between them.
+vec3 bowSheetLens(vec3 direction, float closest, BowSheets s, float x) {
+  if (s.weight==vec3(0.0)) return direction;
+  vec3 u=(closest+s.offset)/(.16+max(x,0.0)*.006);
+  float bend=dot(s.weight*u*exp(-u*u),vec3(1.0,.8,.65))*BOW_SHEET_LENS*uLensing*uEntrance;
+  vec3 across=s.normal-direction*dot(direction,s.normal);
+  return normalize(direction-across*bend);
+}
+#endif
+// The sheets' light. Each is a faint grazing line with a sharp outer edge and
+// a soft smear inward, broken into stretches and gaps by the fluid that
+// streams over it, with its own film colour: ghostly arcs of the space beside
+// the rim squeezed into them (as for the crest) and the whole sky round the
+// camera, paler than the rim; the deeper ones wider and dimmer, smeared.
+// Between the arcs the film shows sparse soft spots of colour (see below).
+vec3 bowLayers(BowSheets s, float closest, vec3 rimPoint, vec2 screenNormal, float worldPixel, float gain) {
+  float deepest=max(s.offset.x,max(s.offset.y,s.offset.z));
+  if (s.weight==vec3(0.0) || closest>worldPixel*4.0 || closest<-deepest*1.5-worldPixel*6.0) return vec3(0.0);
+  vec2 source=vUv+screenNormal*(dot(vec2(.5)-vUv,screenNormal)+.12);
+  vec3 seen=backgroundLod(source,2.5)*.6+skyAverage()*.4;
+  vec3 light=seen*gain*spaceExposure();
+  light/=1.0+dot(light,vec3(.2126,.7152,.0722))*.45;
+  light=mix(light,knee(light,.30,.20),nebulaOn())*crestKey(s.normal.y);
+  // Paler than the light they reflect, as thin glass is.
+  light=mix(light,vec3(dot(light,vec3(.2126,.7152,.0722)))*vec3(.88,.97,1.06),.55);
+  float fringe=uBow.x*bowFringeScale(worldPixel);
+  vec3 sum=vec3(0.0);
+  for (int k=0;k<3;k++) {
+    float fk=float(k);
+    if (s.weight[k]<=0.0) continue;
+    // Where the arcs crowd within a few pixels of each other their colours
+    // and fringes fade, as fine interference stripes blend to white.
+    float roomy=smoothstep(3.0,11.0,s.offset[k]*.30/worldPixel);
+    float width=worldPixel*BOW_WIDTH[k]+s.offset[k]*.025;
+    float a=(closest+s.offset[k])/width;
+#ifdef BOW_DISPERSION
+    // Red a little inside each arc, blue a little outside it: under a pixel
+    // apart (the deep arcs are several pixels wide, and splitting them by a
+    // share of their width laid a red band along each).
+    vec3 across=a+vec3(1.0,0.0,-1.0)*fringe*(.50+.25*fk)*roomy*worldPixel/width;
+#else
+    vec3 across=vec3(a);
+#endif
+    // A thin core with a sharp outer edge, and a soft smear inward over the
+    // rays that pass through the sheet. Only the core is split: shifting the
+    // long smear tinted all of it red.
+    vec3 core=exp(-across*across*1.2);
+    float smear=.22*exp(-max(-a,0.0)*.40)*(1.0-smoothstep(-.6,1.2,a));
+    // Long stretches of each arc are nearly dark, so the arcs are broken
+    // rather than whole rings.
+    float stretch=smoothstep(.34,.64,s.stretch[k]);
+    float level=BOW_LEVEL[k]*(.05+.95*stretch)*s.weight[k];
+#ifdef BOW_FILM
+    // The film colours the thin core; the smear inward stays paler. Its hue
+    // follows the dye that breaks the arc up, so it changes along the arc
+    // with the bright stretches, and the deeper arcs are paler.
+    vec3 tint=filmTint(s.uv,s.vertical,.85+s.stretch[k]*1.6,rimPoint.x,fk+1.0,roomy*(1.0-.22*fk),worldPixel);
+    sum+=(core*tint+smear*mix(vec3(1.0),tint,.35))*level;
+#else
+    sum+=(core+smear)*level;
+#endif
+  }
+#ifdef BOW_FILM
+  // Sparse soft spots of film colour in the glass between the rim and the
+  // deepest arc, fading in from just inside the rim and out before the last
+  // arc. A lattice addressed along the arc by the full-resolution dye on the
+  // silhouette line where the ray grazes the glass, smoothed over a few of
+  // its cells (so they stream downstream with the flow and stay compact; the
+  // box-filtered dye barely changes along the bow, and lit whole bands at
+  // once), and across it by the depth. With Fluid-driven film thickness off
+  // they are addressed by their place along the bow, so they sit still.
+  float between=clamp(-closest/max(deepest,1e-4),0.0,1.0);
+  float glass=smoothstep(0.0,.25,between)*(1.0-smoothstep(.65,1.0,between))*max(s.weight.x,max(s.weight.y,s.weight.z));
+  if (glass>0.0) {
+    vec3 d0;
+    if (uFilmFlow>.5) {
+      vec2 cell=vec2(2.5/512.0,2.5/256.0);
+      d0=(bowFineDye(s.uv+cell,.31,s.vertical)+bowFineDye(s.uv-cell,.31,s.vertical)
+        +bowFineDye(s.uv+vec2(cell.x,-cell.y),.31,s.vertical)+bowFineDye(s.uv+vec2(-cell.x,cell.y),.31,s.vertical))*.25;
+    } else {
+      d0=vec3(s.uv.x*LENGTH*.03,.5,s.uv.x*LENGTH*.02);
+    }
+    float blob=smoothNoise(vec3(d0.r*BOW_GLASS_GRAIN,d0.b*BOW_GLASS_GRAIN+between*1.6,3.0+d0.g*BOW_GLASS_GRAIN*.6));
+    float spot=smoothstep(.58,.82,blob);
+    // Each spot is one pale interference colour, picked by the film's
+    // thickness (the same dye; fixed with Fluid-driven film thickness off).
+    float thickness=uFilmFlow>.5 ? d0.b*2.0+d0.r*1.3+d0.g : 1.7;
+    vec3 colour=mix(filmColour(.25+.25*sin(6.2831853*(thickness+between*.4))),vec3(1.0),.55);
+    sum+=glass*spot*BOW_GLASS*min(uBow.y,1.5)*mix(.30,1.0,bowNose(rimPoint.x))*colour;
+  }
+#endif
+  return sum*light*min(uBow.z,2.0)*uEntrance*min(1.0,uIntensity*.5);
+}
+#endif
 `;
 
 // The thick crest, shared by all three appearances: the front of the
@@ -1284,7 +1702,20 @@ vec3 crestLight(Section section, float worldPixel, float key, float patches, flo
   float shell=(crestProfile(shifted-.375*pixelRho,eta)+crestProfile(shifted-.125*pixelRho,eta)
     +crestProfile(shifted+.125*pixelRho,eta)+crestProfile(shifted+.375*pixelRho,eta))*.25;
   shell*=smoothstep(0.0,1.5*pixelRho,1.0-shifted);
+#ifdef BOW_DISPERSION
+  // The thin glass refracts red a little inward and blue a little outward,
+  // most at the nose, so the arc's edges carry a colour fringe: under a pixel,
+  // a length on the field that fades as the camera pulls back.
+  float split=uBow.x*mix(.12,.70,bowNose(section.entry.x))*bowFringeScale(worldPixel)*pixelRho;
+  vec3 shells=vec3((crestProfile(shifted+split-.25*pixelRho,eta)+crestProfile(shifted+split+.25*pixelRho,eta))*.5
+      *smoothstep(0.0,1.5*pixelRho,1.0-shifted-split),
+    shell,
+    (crestProfile(shifted-split-.25*pixelRho,eta)+crestProfile(shifted-split+.25*pixelRho,eta))*.5
+      *smoothstep(0.0,1.5*pixelRho,1.0-shifted+split));
+  if (max(shells.r,max(shells.g,shells.b))<=.0001) return vec3(0.0);
+#else
   if (shell<=.0001) return vec3(0.0);
+#endif
   vec3 n=rippledNormal(section,crestUv);
   vec3 v=normalize(section.entry-uCameraPosition);
   // Rippled glossy shell: grazing reflection plus a broad highlight from above.
@@ -1327,7 +1758,15 @@ vec3 crestLight(Section section, float worldPixel, float key, float patches, flo
   // The same knee as the gathered glow: bright gas behind must not push the
   // crest into a white glare.
   light=mix(light,knee(light,.32,.22),nebulaOn());
+#ifdef BOW_FILM
+  // Soap-film colour on the glass, carried by the same dye as the crest.
+  light*=filmTint(section.sideUv,section.vertical,1.0-min(depthIn,1.0),section.entry.x,0.0,1.0,worldPixel);
+#endif
+#ifdef BOW_DISPERSION
+  return light*shells*fade*uEntrance*min(1.0,uIntensity*.5);
+#else
   return light*shell*fade*uEntrance*min(1.0,uIntensity*.5);
+#endif
 }
 `;
 
@@ -1407,6 +1846,7 @@ uniform vec3 uCameraPosition;
 uniform vec2 uResolution;
 uniform float uTurbulence, uIntensity, uEntrance, uLensing;
 ${sceneSampling}
+${bowRefraction}
 const float TAU=6.2831853;
 const float LENGTH=390.0;
 
@@ -1445,6 +1885,7 @@ vec3 crestEnvironment(vec2 screenNormal, vec3 normal, vec3 side, vec3 reflected,
   gain=44.0*spaceExposure(); whiten=1.0;
   return reflected*.60+skyAverage()*.40;
 }
+${bowSurface}
 ${fieldCrest}
 ${gasAmbientChunk}
 
@@ -1467,6 +1908,18 @@ void main() {
   vec3 radiance=vec3(0.0);
   float transmittance=1.0,travelled=nearT;
   vec4 gas=vec4(0.0);
+#if defined(BOW_DISPERSION) || defined(BOW_LAYERS)
+  // The ray's closest approach to the surface, for the bow's arcs and fringes.
+  float closest=1e5;
+  vec3 rimPoint=p, rimNormal=vec3(0.0,1.0,0.0);
+#endif
+#ifdef BOW_LAYERS
+  // Where the ray passes deepest under the surface (by sheetDistance()), and
+  // its direction and step there, to refine it for the nested sheets.
+  float sheetNearest=1e5;
+  vec3 sheetPoint=p, sheetDirection=direction;
+  float sheetStep=0.0;
+#endif
   for (int i=0;i<STEPS;i++) {
     if (travelled>=farT) break;
     Shape shape=profile(p.x);
@@ -1490,13 +1943,22 @@ void main() {
       gradient=2.0*q/radii;
     }
     float baseDistance=implicitDistance/max(length(gradient),.001);
+#ifdef BOW_LAYERS
+    float sheetHere=sheetDistance(baseDistance,implicitDistance,gradient,heightSlope,shape.slope,y,scale,depth,height,p.x);
+#endif
     vec3 baseNormal=gradient/max(length(gradient),.0001);
+#if defined(BOW_DISPERSION) || defined(BOW_LAYERS)
+    if (baseDistance<closest) { closest=baseDistance; rimPoint=p; rimNormal=baseNormal; }
+#endif
     float wake=smoothstep(8.0,130.0,p.x);
     float minStep=.035+max(p.x,0.0)*.0012;
     float stepSize=min(clamp(abs(baseDistance)*.42,minStep,(farT-nearT)/22.0),farT-travelled);
     // Resolve a real, thin internal shear sheet, not a fixed centre guide line.
     float sheetExtent=1.0-smoothstep(depth*.70,depth*.98,abs(p.z));
     if (p.x>1.0 && sheetExtent>.001) stepSize=min(stepSize,max(minStep,abs(y)*.45)/max(abs(direction.y),.18));
+#ifdef BOW_LAYERS
+    if (sheetHere<sheetNearest) { sheetNearest=sheetHere; sheetPoint=p; sheetDirection=direction; sheetStep=stepSize; }
+#endif
 #ifdef GAS_FIELD
     if (baseDistance<0.0) gasEntered=1.0;
     else if (baseDistance<gasReach) {
@@ -1612,7 +2074,28 @@ void main() {
   // Dark, demagnified interiors, as in the compressed appearances.
   Section section=viewSection(ro,originalDirection);
   float interior=interiorAmount(section,ro,originalDirection);
+#if defined(BOW_DISPERSION) || defined(BOW_LAYERS)
+  float rimPixel=2.0*length(rimPoint-ro)/(uProjection[1][1]*uResolution.y);
+#endif
+#ifdef BOW_LAYERS
+  // The sheets lie inside the surface, so pixels whose rays stay clear of it
+  // skip them (with a margin over the march's own, slightly coarser
+  // distance), as do pixels where none of them can show.
+  float sheetClosest=sheetNearest;
+  BowSheets sheets=noSheets();
+  if (sheetNearest<rimPixel*4.0+.3 && bowSheetsShow(sheetPoint.x,rimPixel)) {
+    sheetClosest=refinedClosest(sheetPoint,sheetDirection,sheetStep);
+    sheets=bowSheets(sheetClosest,sheetPoint,rimPixel,smoothstep(-.5,1.0,sheetPoint.x)*tailFade(sheetPoint.x));
+  }
+#ifdef BOW_LAYER_LENS
+  direction=bowSheetLens(direction,sheetClosest,sheets,sheetPoint.x);
+#endif
+#endif
+#ifdef BOW_DISPERSION
+  vec3 refracted=interiorView(section,ro,direction,interior,uEntrance*min(1.0,uIntensity*.5),bowDispersion(direction,originalDirection,rimPoint.x,rimPixel));
+#else
   vec3 refracted=interiorView(section,ro,direction,interior,uEntrance*min(1.0,uIntensity*.5));
+#endif
 #ifdef GAS_FIELD
   refracted=gasBehindField(refracted,gasFront,gasBack,section,interior,ro,originalDirection);
 #endif
@@ -1623,6 +2106,12 @@ void main() {
     float crestFade=smoothstep(-.5,1.0,section.entry.x)*tailFade(section.entry.x);
     radiance+=crestLight(section,worldPixel,crestKey(section.side.y),crestPatches(section.sideUv),crestFade)*transmittance;
   }
+#ifdef BOW_LAYERS
+  {
+    vec2 normal=normalize((projectPosition(rimPoint+rimNormal)-projectPosition(rimPoint))*uResolution+vec2(.00001));
+    radiance+=bowLayers(sheets,sheetClosest,sheetPoint,normal,rimPixel,40.0)*transmittance;
+  }
+#endif
   // The fluid's gas hardly dimmed the old near-black backdrop; with a nebula
   // behind it, the gas in front occludes it instead of adding to it twice.
 #ifdef GAS_FIELD
@@ -1642,6 +2131,7 @@ uniform vec3 uCameraPosition;
 uniform vec2 uResolution;
 uniform float uTurbulence, uIntensity, uEntrance, uLensing, uBloom, uBandGlow, uEdgeGlow, uProjectionWidth;
 ${sceneSampling}
+${bowRefraction}
 const float TAU=6.2831853;
 const float LENGTH=390.0;
 
@@ -1732,14 +2222,41 @@ vec3 bandLight(vec3 source, float concentration) {
   // nebula colour or adding an independently coloured/emitting material.
   return energy/(1.0+dot(energy,vec3(.2126,.7152,.0722))*.45);
 }
+#if defined(BOW_DISPERSION) || defined(BOW_FILM)
+#define BOW_BAND_OPTICS
+// The bow's optics on a band (Effects › Bow): its colour fringe (red inward,
+// blue outward, in band half-widths) and its soap-film tint. The rim passes
+// its own; the centre stream passes plainBand().
+struct BandOptics { float split; vec3 tint; };
+BandOptics plainBand() { BandOptics o; o.split=0.0; o.tint=vec3(1.0); return o; }
+#endif
 // 'under' is the space the band must not be drawn darker than (about half
 // of it): the brighter of what is behind the band and the unbent view.
 vec3 illuminateBand(vec3 base, vec2 screenNormal, vec3 worldNormal,
-                    float across, float halfWidthPixels, float fade, float strength, float edgeGlow, float shade, float haloScale, vec3 under) {
+                    float across, float halfWidthPixels, float fade, float strength, float edgeGlow, float shade, float haloScale, vec3 under
+#ifdef BOW_BAND_OPTICS
+                    , BandOptics optics
+#endif
+                    ) {
+#ifdef BOW_DISPERSION
+  // Red and blue sit optics.split half-widths either side of green, so their
+  // halos reach that much farther out.
+  if (abs(across)>4.0+abs(optics.split) || fade<=0.0 || uIntensity<=0.0) return base;
+#else
   if (abs(across)>4.0 || fade<=0.0 || uIntensity<=0.0) return base;
+#endif
+#ifdef BOW_DISPERSION
+  vec3 acrossRGB=across+vec3(optics.split,0.0,-optics.split);
+  vec3 opacity=(1.0-smoothstep(.65,1.0,abs(acrossRGB)))*fade*uEntrance*min(1.0,uIntensity*.5);
+#else
   float opacity=(1.0-smoothstep(.65,1.0,abs(across)))*fade*uEntrance*min(1.0,uIntensity*.5);
+#endif
   if (uBandGlow<.5) {
+#ifdef BOW_DISPERSION
+    vec3 mask=1.0-smoothstep(.88,1.0,abs(acrossRGB));
+#else
     float mask=1.0-smoothstep(.88,1.0,abs(across));
+#endif
     float visibility=fade*uEntrance*min(1.0,uIntensity*.5);
     vec3 projected=projectedSpace(clamp(across,-1.0,1.0),halfWidthPixels);
     // Recover light lost to minification, retaining the actual projected
@@ -1747,6 +2264,9 @@ vec3 illuminateBand(vec3 base, vec2 screenNormal, vec3 worldNormal,
     float compression=.48*uResolution.y/max(halfWidthPixels,1.0);
     float gain=clamp(sqrt(compression)*1.3,4.0,18.0)*mix(.75,1.0,strength)*spaceExposure();
     vec3 detail=bandLight(projected,gain*(1.0+edgeGlow*2.0))*shade;
+#ifdef BOW_FILM
+    detail*=optics.tint;
+#endif
     // The ribbon is a compressed image of space, never an ink outline: it is
     // not drawn darker than about half of the space just beside it.
     detail=max(detail,under*.55*edgeFloor());
@@ -1787,8 +2307,16 @@ vec3 illuminateBand(vec3 base, vec2 screenNormal, vec3 worldNormal,
   // the gathered luminance itself caps them; ordinary levels pass unchanged.
   glow=mix(glow,knee(glow,.20,.12),nebulaOn());
   detail=mix(detail,knee(detail,.26,.16),nebulaOn());
+#ifdef BOW_FILM
+  detail*=optics.tint; glow*=optics.tint;
+#endif
+#ifdef BOW_DISPERSION
+  vec3 core=exp(-acrossRGB*acrossRGB*1.8);
+  vec3 halo=exp(-acrossRGB*acrossRGB*.32)*uBloom*.38*haloScale;
+#else
   float core=exp(-across*across*1.8);
   float halo=exp(-across*across*.32)*uBloom*.38*haloScale;
+#endif
   vec3 color=mix(base,detail,opacity*.70);
   return color+glow*(core+halo)*fade*uEntrance*uIntensity*strength*shade;
 }
@@ -1831,6 +2359,7 @@ vec3 crestEnvironment(vec2 screenNormal, vec3 normal, vec3 side, vec3 reflected,
   gain=22.0*spaceExposure(); whiten=.35;
   return reflected*.75+skyAverage()*.25;
 }
+${bowSurface}
 ${fieldCrest}
 ${gasAmbientChunk}
 
@@ -1853,6 +2382,13 @@ void main() {
   float travelled=nearT;
   float closest=1e5;
   vec3 rimPoint=p, rimNormal=vec3(0.0,1.0,0.0);
+#ifdef BOW_LAYERS
+  // Where the ray passes deepest under the surface (by sheetDistance()), and
+  // its direction and step there, to refine it for the nested sheets.
+  float sheetNearest=1e5;
+  vec3 sheetPoint=p, sheetDirection=direction;
+  float sheetStep=0.0;
+#endif
   for (int i=0;i<STEPS;i++) {
     if (travelled>=farT) break;
     Shape shape=profile(p.x);
@@ -1875,6 +2411,9 @@ void main() {
       gradient=2.0*q/radii;
     }
     float baseDistance=implicitDistance/max(length(gradient),.001);
+#ifdef BOW_LAYERS
+    float sheetHere=sheetDistance(baseDistance,implicitDistance,gradient,heightSlope,shape.slope,y,scale,depth,height,p.x);
+#endif
     vec3 baseNormal=gradient/max(length(gradient),.0001);
     if (baseDistance<closest) {
       closest=baseDistance; rimPoint=p; rimNormal=baseNormal;
@@ -1882,6 +2421,9 @@ void main() {
     float wake=smoothstep(8.0,130.0,p.x);
     float minStep=.035+max(p.x,0.0)*.0012;
     float stepSize=min(clamp(abs(baseDistance)*.42,minStep,(farT-nearT)/22.0),farT-travelled);
+#ifdef BOW_LAYERS
+    if (sheetHere<sheetNearest) { sheetNearest=sheetHere; sheetPoint=p; sheetDirection=direction; sheetStep=stepSize; }
+#endif
 #ifdef GAS_FIELD
     if (baseDistance<0.0) gasEntered=1.0;
     else if (baseDistance<gasReach) {
@@ -1929,7 +2471,25 @@ void main() {
   // through the inside is demagnified and dimmed. The energy-conserving
   // experiment ties the loss to the brightness of the crest above it.
   float interior=interiorAmount(section,ro,originalDirection);
+#ifdef BOW_LAYERS
+  // The sheets lie inside the surface, so pixels whose rays stay clear of it
+  // skip them (with a margin over the march's own, slightly coarser
+  // distance), as do pixels where none of them can show.
+  float sheetClosest=sheetNearest;
+  BowSheets sheets=noSheets();
+  if (sheetNearest<worldPixel*4.0+.3 && bowSheetsShow(sheetPoint.x,worldPixel)) {
+    sheetClosest=refinedClosest(sheetPoint,sheetDirection,sheetStep);
+    sheets=bowSheets(sheetClosest,sheetPoint,worldPixel,smoothstep(-.5,1.0,sheetPoint.x)*tailFade(sheetPoint.x));
+  }
+#ifdef BOW_LAYER_LENS
+  direction=bowSheetLens(direction,sheetClosest,sheets,sheetPoint.x);
+#endif
+#endif
+#ifdef BOW_DISPERSION
+  vec3 color=interiorView(section,ro,direction,interior,fieldLight,bowDispersion(direction,originalDirection,rimPoint.x,worldPixel));
+#else
   vec3 color=interiorView(section,ro,direction,interior,fieldLight);
+#endif
 #ifdef GAS_FIELD
   color=gasBehindField(color,gasFront,gasBack,section,interior,ro,originalDirection);
 #endif
@@ -1951,11 +2511,33 @@ void main() {
   // floor also follows the unbent view of the space behind the edge: against
   // bright gas the edge never reads as an ink outline.
   vec3 under=max(color,backgroundAlong(originalDirection)*.9);
+#ifdef BOW_BAND_OPTICS
+  BandOptics rimOptics=plainBand();
+#ifdef BOW_DISPERSION
+  // About a pixel of fringe at the nose in the close-ups, a third of that
+  // downstream, and less than a pixel once the camera pulls back.
+  // Where the rim is at its narrowest (a pixel and a quarter either side)
+  // its edge is a stair-step, and a split would bead it with red and blue; it
+  // fades there.
+  rimOptics.split=uBow.x*mix(.15,1.0,bowNose(rimPoint.x))*bowFringeScale(worldPixel)*worldPixel/width
+    *smoothstep(1.3,2.2,width/worldPixel);
+#endif
+#ifdef BOW_FILM
+  // Compressed glow's rim is mostly gathered light, which the tint barely
+  // showed through at the crest's strength.
+  rimOptics.tint=filmTint(section.sideUv,section.vertical,1.0,rimPoint.x,0.0,uBandGlow>.5 ? 1.5 : 1.0,worldPixel);
+#endif
+  color=illuminateBand(color,normal,rimNormal,across,width/worldPixel,fade,1.0,uEdgeGlow,edgeShade,1.0-.65*min(uCrestThickness,1.0),under,rimOptics);
+#else
   color=illuminateBand(color,normal,rimNormal,across,width/worldPixel,fade,1.0,uEdgeGlow,edgeShade,1.0-.65*min(uCrestThickness,1.0),under);
+#endif
   if (uCrestThickness>0.0 && section.front>0.0) {
     float crestFade=smoothstep(-.5,1.0,section.entry.x)*tailFade(section.entry.x);
     color+=crestLight(section,worldPixel,crestKey(section.side.y),patches,crestFade);
   }
+#ifdef BOW_LAYERS
+  color+=bowLayers(sheets,sheetClosest,sheetPoint,normal,worldPixel,uBandGlow>.5 ? 60.0 : 34.0);
+#endif
   // The lens ring just inside the silhouette bends in space from far away
   // (the dark sky, for the lower edge); against bright gas it read as a
   // heavy dark outline once the dimmer lower crest no longer covered it. It
@@ -1980,7 +2562,11 @@ void main() {
   // broader, softer centre stream in gradually behind it.
   float centerFade=smoothstep(6.2,8.5,axis.x)*tailFade(axis.x);
   centerFade*=1.0-smoothstep(.85,.98,abs(originalDirection.x));
+#ifdef BOW_BAND_OPTICS
+  color=illuminateBand(color,axisNormal,vec3(0.0,1.0,0.0),centerAcross,halfWidth,centerFade,.38,0.0,1.0,1.0,color,plainBand());
+#else
   color=illuminateBand(color,axisNormal,vec3(0.0,1.0,0.0),centerAcross,halfWidth,centerFade,.38,0.0,1.0,1.0,color);
+#endif
   color+=heroCaustic(abs(closest)/worldPixel,fade);
 #ifdef GAS_FIELD
   color=gasInFront(color);

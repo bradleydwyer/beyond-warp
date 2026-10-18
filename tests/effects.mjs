@@ -3,9 +3,14 @@ import assert from 'node:assert/strict';
 const SLIDERS = ['nebula', 'nebulaDensity', 'nebulaGlow', 'blackLevel', 'interior', 'interiorShrink', 'crestThickness', 'crestLight', 'crestVariation',
   'gas', 'gasShock', 'gasPileup', 'gasDepth', 'gasFlow',
   'streak', 'streakLength', 'streakTint', 'heroFlares', 'starStreaks',
-  'grain', 'softness', 'focus', 'dust', 'grade', 'vignette'];
+  'grain', 'softness', 'focus', 'dust', 'grade', 'vignette',
+  'dispersion', 'iridescence', 'bowLayers', 'layerSpread'];
 // Experiments (checkboxes that are on by default).
-const TOGGLES = ['energyRim', 'gasReacts'];
+const TOGGLES = ['energyRim', 'gasReacts', 'filmFlow', 'layerRefraction'];
+// The bow's optics act at the bow and hand over to the plain rim as the
+// camera pulls back, so checkBow tests them in the Bow camera (and that they
+// leave the wide shot's nose alone) rather than in the wide default still.
+const BOW_CONTROLS = ['dispersion', 'iridescence', 'bowLayers', 'layerSpread', 'filmFlow', 'layerRefraction'];
 
 // The Effects panel: every control changes the picture, survives appearance
 // switches and replays, can be set from the URL, and stays deterministic.
@@ -37,11 +42,14 @@ export async function checkEffects(browser, url) {
     for (const id of SLIDERS) {
       const original = await page.locator(`#${id}`).inputValue();
       assert(Number(original) > 0, `${id} should be on by default`);
+      if (BOW_CONTROLS.includes(id)) continue;
       await setRange(id, 0);
       assert.notEqual(await hash(), defaults, `${id} at 0 did not change the frame`);
       await setRange(id, original);
     }
     for (const id of TOGGLES) {
+      assert(await page.locator(`#${id}`).isChecked(), `${id} should be on by default`);
+      if (BOW_CONTROLS.includes(id)) continue;
       await page.locator(`#${id}`).uncheck();
       assert.notEqual(await hash(), defaults, `${id} toggle did not change the frame`);
       await page.locator(`#${id}`).check();
@@ -67,11 +75,12 @@ export async function checkEffects(browser, url) {
     for (const id of TOGGLES) assert.equal(await page.locator(`#${id}`).isChecked(), false, `All off left the ${id} experiment on`);
     assert.equal(await page.locator('#letterbox').isChecked(), false, 'All off left the letterbox on');
     await setRange('crestThickness', 1.4);
+    await setRange('bowLayers', 1.5);
     for (const appearance of ['fluid', 'space', 'glow']) await page.locator(`[data-appearance="${appearance}"]`).click();
     await page.locator('#reference-play').click();
     await page.waitForFunction(() => window.warp.reference.time > .1);
-    const kept = await page.evaluate(() => [window.warp.state.crestThickness, window.warp.state.nebula, window.warp.state.energyRim]);
-    assert.deepEqual(kept, [1.4, 0, false], 'Appearance switches or replay reset the effect controls');
+    const kept = await page.evaluate(() => [window.warp.state.crestThickness, window.warp.state.nebula, window.warp.state.energyRim, window.warp.state.bowLayers, window.warp.state.dispersion]);
+    assert.deepEqual(kept, [1.4, 0, false, 1.5, 0], 'Appearance switches or replay reset the effect controls');
     await page.evaluate(() => window.warp.pause());
 
     // Compressed space reprojects bright gas into its ribbons: at the
@@ -90,10 +99,12 @@ export async function checkEffects(browser, url) {
     });
     assert(black < .002, `Compressed space draws ${(black * 100).toFixed(2)}% pure-black pixels`);
 
-    await page.goto(`${url}/?paused&time=10&crestThickness=0.5&energyRim=0`);
+    await page.goto(`${url}/?paused&time=10&crestThickness=0.5&energyRim=0&layerSpread=0.7&layerRefraction=0`);
     await page.waitForFunction(() => window.warp && document.getElementById('loading').hidden);
     assert.equal(await page.locator('#crestThickness').inputValue(), '0.5', 'URL parameter did not set the slider');
     assert.equal(await page.locator('#energyRim').isChecked(), false, 'URL parameter did not set the toggle');
+    assert.equal(await page.locator('#layerSpread').inputValue(), '0.7', 'URL parameter did not set a Bow slider');
+    assert.equal(await page.locator('#layerRefraction').isChecked(), false, 'URL parameter did not set a Bow experiment');
     assert.deepEqual(errors, []);
     console.log('PASS: effect controls change the frame, restore exactly, bypass and reset in one click, survive appearance switches and replay, and read URL parameters');
   } finally {
@@ -101,6 +112,186 @@ export async function checkEffects(browser, url) {
   }
   await checkFilm(browser, url);
   await checkGas(browser, url);
+  await checkBow(browser, url);
+}
+
+// The bow close-up (Effects › Bow), in the Bow camera: every Bow control
+// changes the close-up and restores it exactly, the frame is still while
+// paused, dispersion really separates the red and blue channels round the
+// nose, and 0% is the same frame as a fresh load without it (its shader
+// define is removed). In each appearance the nested layers draw separate thin
+// arcs (rows across the upper bow cross several distinct ridges of the light
+// they add) and the optics at 0 are a fresh load without them. In the wide
+// shot the optics hand over to the plain rim: the nose gains no red/blue
+// outline and hardly changes. Pushed to 200%, the layers neither wash out the
+// bow's interior nor reach into the on-board view.
+export async function checkBow(browser, url) {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 536 } });
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
+  const ready = () => page.waitForFunction(() => window.warp && document.getElementById('loading').hidden);
+  const set = (id, value) => page.locator(`#${id}`).evaluate((el, v) => {
+    if (el.type === 'checkbox') { el.checked = v; el.dispatchEvent(new Event('change', { bubbles: true })); }
+    else { el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); }
+  }, value);
+  // Hash; the channels of a box (fractions x0, x1, y0, y1, top-down); and the
+  // correlation of the horizontally high-passed red and blue channels in it
+  // (1 when they line up, lower as they separate).
+  const frame = box => page.evaluate(box => {
+    window.warp.render();
+    const gl = document.querySelector('canvas').getContext('webgl2');
+    const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let hash = 2166136261;
+    for (let i = 0; i < px.length; i += 16) hash = Math.imul(hash ^ px[i] ^ (px[i + 1] << 8) ^ (px[i + 2] << 16), 16777619);
+    const at = (x, y, c) => px[((h - 1 - y) * w + x) * 4 + c];
+    const channels = [];
+    let rb = 0, rr = 0, bb = 0;
+    for (let y = Math.round(box[2] * h); y < Math.round(box[3] * h); y++) for (let x = Math.round(box[0] * w); x < Math.round(box[1] * w); x++) {
+      channels.push(at(x, y, 0), at(x, y, 1), at(x, y, 2));
+      if (x < 3 || x > w - 4) continue;
+      const pass = c => at(x, y, c) - (at(x - 3, y, c) + at(x + 3, y, c)) * .5;
+      const r = pass(0), b = pass(2);
+      rb += r * b; rr += r * r; bb += b * b;
+    }
+    return { hash: hash >>> 0, channels, correlation: rb / Math.sqrt(rr * bb + 1e-9) };
+  }, box);
+  const moved = (a, b) => [0, 1, 2].map(c => {
+    let sum = 0;
+    for (let i = c; i < a.channels.length; i += 3) sum += Math.abs(a.channels[i] - b.channels[i]);
+    return sum / (a.channels.length / 3);
+  });
+  const redBlue = (f, q) => {
+    const d = [];
+    for (let i = 0; i < f.channels.length; i += 3) d.push(f.channels[i] - f.channels[i + 2]);
+    d.sort((p, r) => p - r);
+    return d[Math.floor(q * (d.length - 1))];
+  };
+  const NOSE = [.38, .62, .05, .95];
+  // Smoothed luminance along rows through the upper bow, and the number of
+  // distinct ridges (thin arcs) in a row: peaks standing a given number of
+  // levels above both sides within 12 pixels.
+  const rows = () => page.evaluate(() => {
+    window.warp.render();
+    const gl = document.querySelector('canvas').getContext('webgl2');
+    const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const lum = (x, y) => { const i = ((h - 1 - y) * w + x) * 4; return .2126 * px[i] + .7152 * px[i + 1] + .0722 * px[i + 2]; };
+    return [.08, .12, .16, .2, .25, .3].map(fy => {
+      const y = Math.round(fy * h), row = [];
+      for (let x = Math.round(.38 * w); x < Math.round(.9 * w); x++) {
+        let s = 0;
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -1; dx <= 1; dx++) s += lum(x + dx, y + dy);
+        row.push(s / 15);
+      }
+      return row;
+    });
+  });
+  const ridges = (row, prominence) => {
+    let count = 0;
+    for (let i = 1; i < row.length - 1; i++) {
+      if (row[i] <= row[i - 1] || row[i] < row[i + 1]) continue;
+      let left = row[i], right = row[i];
+      for (let j = 1; j <= 12; j++) { left = Math.min(left, row[Math.max(i - j, 0)]); right = Math.min(right, row[Math.min(i + j, row.length - 1)]); }
+      if (row[i] - Math.max(left, right) > prominence) count++;
+    }
+    return count;
+  };
+  try {
+    await page.goto(`${url}/?paused&time=10&view=bow`);
+    await ready();
+    await page.locator('#effects summary').click();
+    const lit = await frame(NOSE);
+    for (let i = 0; i < 3; i++) assert.equal((await frame(NOSE)).hash, lit.hash, 'The bow optics flicker while paused');
+    for (const id of BOW_CONTROLS) {
+      const toggle = await page.locator(`#${id}`).evaluate(el => el.type === 'checkbox');
+      const original = toggle ? true : await page.locator(`#${id}`).inputValue();
+      await set(id, toggle ? false : '0');
+      assert.notEqual((await frame(NOSE)).hash, lit.hash, `${id} off did not change the bow`);
+      await set(id, original);
+    }
+    assert.equal((await frame(NOSE)).hash, lit.hash, 'Restoring the bow controls did not restore the frame');
+    // Dispersion alone, against the plain bow: red and blue move apart far
+    // more than green, and their fine detail no longer lines up.
+    for (const id of ['dispersion', 'iridescence', 'bowLayers']) await set(id, '0');
+    const plain = await frame(NOSE);
+    await set('dispersion', '1');
+    const dispersed = await frame(NOSE);
+    const [r, g, b] = moved(dispersed, plain);
+    assert(r + b > 2.5 * g && plain.correlation - dispersed.correlation > .05,
+      `Dispersion does not separate the channels at the bow (mean change r ${r.toFixed(2)}, g ${g.toFixed(2)}, b ${b.toFixed(2)}; red/blue correlation ${plain.correlation.toFixed(3)} -> ${dispersed.correlation.toFixed(3)})`);
+    await set('layerSpread', '0');
+    await set('dispersion', '0');
+    await set('bowLayers', '1');
+    assert.equal((await frame(NOSE)).hash, plain.hash, 'Layer spread at 0 is not the same frame as Bow layers at 0');
+    await page.goto(`${url}/?paused&time=10&view=bow&dispersion=0`);
+    await ready();
+    const noDispersion = await frame(NOSE);
+    await page.goto(`${url}/?paused&time=10&view=bow`);
+    await ready();
+    await set('dispersion', '0');
+    assert.equal((await frame(NOSE)).hash, noDispersion.hash, 'Dispersion at 0% is not the frame without it');
+
+    // Several thin arcs, not one curve, in all three appearances, and all of
+    // the optics at 0 is a fresh load without them.
+    const arcs = {};
+    for (const appearance of ['glow', 'fluid', 'space']) {
+      await page.goto(`${url}/?paused&time=10&view=bow&appearance=${appearance}`);
+      await ready();
+      const on = await frame(NOSE);
+      const layered = await rows();
+      await set('bowLayers', '0');
+      const single = await rows();
+      const added = layered.reduce((sum, row, k) => sum + ridges(row.map((v, i) => v - single[k][i]), 5), 0);
+      assert(added >= 9, `The bow layers do not draw separate arcs in ${appearance} (${added} ridges over ${layered.length} rows)`);
+      arcs[appearance] = added;
+      for (const id of ['dispersion', 'iridescence']) await set(id, '0');
+      const zeroed = await frame(NOSE);
+      assert.notEqual(zeroed.hash, on.hash, `The bow optics do nothing in ${appearance}`);
+      await page.goto(`${url}/?paused&time=10&view=bow&appearance=${appearance}&dispersion=0&iridescence=0&bowLayers=0`);
+      await ready();
+      assert.equal((await frame(NOSE)).hash, zeroed.hash, `The bow optics at 0 are not the frame without them in ${appearance}`);
+    }
+
+    // The wide shot: no chromatic outline at the nose, and hardly any change.
+    const WIDE_NOSE = [0, .25, .2, .8];
+    const wide = {};
+    for (const appearance of ['glow', 'space']) {
+      await page.goto(`${url}/?paused&time=10&appearance=${appearance}`);
+      await ready();
+      const optics = await frame(WIDE_NOSE);
+      for (const id of ['dispersion', 'iridescence', 'bowLayers']) await set(id, '0');
+      const none = await frame(WIDE_NOSE);
+      const change = Math.max(...moved(optics, none));
+      const outline = redBlue(optics, .999) - redBlue(none, .999);
+      assert(change < 1 && outline <= 3,
+        `The bow optics change the wide shot's nose in ${appearance} (mean change ${change.toFixed(2)}, red-blue p99.9 ${outline > 0 ? '+' : ''}${outline})`);
+      wide[appearance] = `${change.toFixed(2)}/${outline > 0 ? '+' : ''}${outline}`;
+    }
+    // At the top of their range the layers are still a set of arcs: the
+    // interior behind the upper bow does not wash out (the sheets ease off
+    // before the axis), and the on-board view, which looks along the axis,
+    // is untouched by them.
+    const INTERIOR = [.55, .95, .1, .42];
+    const luminance = f => {
+      let sum = 0;
+      for (let i = 0; i < f.channels.length; i += 3) sum += .2126 * f.channels[i] + .7152 * f.channels[i + 1] + .0722 * f.channels[i + 2];
+      return sum / (f.channels.length / 3);
+    };
+    const shot = async (query, box) => { await page.goto(`${url}/?paused&time=10&${query}`); await ready(); return frame(box); };
+    const usual = luminance(await shot('view=bow', INTERIOR));
+    const pushed = luminance(await shot('view=bow&bowLayers=2&layerSpread=2', INTERIOR));
+    assert(pushed < usual * 1.25 + 2, `Bow layers and Layer spread at 200% wash out the bow's interior (mean ${usual.toFixed(1)} -> ${pushed.toFixed(1)})`);
+    const ride = (await shot('view=ride', [0, 1, 0, 1])).hash;
+    assert.equal((await shot('view=ride&bowLayers=2&layerSpread=2', [0, 1, 0, 1])).hash, ride, 'The bow layers reach into the on-board view');
+    assert.deepEqual(errors, []);
+    console.log(`PASS: the bow optics change the close-up and restore exactly, still while paused; dispersion moves red and blue (${r.toFixed(2)}, ${b.toFixed(2)}) more than green (${g.toFixed(2)}), red/blue correlation ${plain.correlation.toFixed(2)} -> ${dispersed.correlation.toFixed(2)}; 0% is the frame without it; separate nested arcs (${arcs.glow}, ${arcs.fluid} and ${arcs.space} ridges over 6 rows in glow, fluid and space); the wide nose barely changes (glow ${wide.glow}, space ${wide.space}); at 200% layers and spread the interior stays dark (mean ${usual.toFixed(1)} -> ${pushed.toFixed(1)}) and the on-board view is untouched`);
+  } finally {
+    await page.close();
+  }
 }
 
 // The gas reacts to the field: it piles up against the outside of the lower

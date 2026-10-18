@@ -48,6 +48,7 @@ const EFFECTS = {
   gas: 1, gasShock: 1, gasPileup: 1, gasDepth: 1, gasFlow: 1, gasReacts: true,
   streak: 1, streakLength: .75, streakTint: .8, heroFlares: 1, starStreaks: 1,
   grain: 1, softness: 1, focus: 1, dust: 1, grade: 1, vignette: 1, letterbox: true,
+  dispersion: 1, iridescence: 1, bowLayers: 1, layerSpread: 1, filmFlow: true, layerRefraction: true,
 };
 const EFFECT_SLIDERS = Object.keys(EFFECTS).filter(key => typeof EFFECTS[key] === 'number');
 const EFFECT_TOGGLES = Object.keys(EFFECTS).filter(key => typeof EFFECTS[key] === 'boolean');
@@ -390,6 +391,7 @@ function init() {
     uProfileSlope: { value: field.derivativeTexture },
     uLensing: { value: state.lensing }, uProjection: { value: camera.projectionMatrix },
     uHeroCaustic: { value: HEROES.map(() => new THREE.Vector4()) },
+    uBow: { value: new THREE.Vector4() }, uFilmFlow: { value: 1 },
   }, { STEPS: quality[state.quality].steps, HERO_COUNT: HEROES.length });
   composite = volume.scene; volumeMaterial = volume.material;
   gasMaterials.push(volumeMaterial);
@@ -858,6 +860,7 @@ function render(dt) {
   volumeMaterial.uniforms.uFluid.value = fluid.texture;
   volumeMaterial.uniforms.uLensing.value = state.lensing;
   volumeMaterial.uniforms.uEntrance.value = THREE.MathUtils.smoothstep(state.entrance, 0, 1);
+  updateBow();
   lens.uniforms.uTime.value = state.time;
   updateFilm();
   ship.visible = state.ship && state.view !== 'ride';
@@ -902,6 +905,30 @@ function updateGas() {
   shared.uGasDepth.value = effectValue('gasDepth');
   shared.uGasTail.value.set(field.tail.start, field.tail.end);
   gasFlow.update(renderer, state.travel);
+}
+
+// The bow close-up (Effects › Bow). Each part switches a shader define, so at
+// 0% (or off) it is compiled out and the picture is exactly the one without
+// it; the bow layers need both their strength and their spread, and the
+// Layered refraction experiment needs the layers.
+const bowLayersOn = () => effectValue('bowLayers') > 0 && effectValue('layerSpread') > 0;
+const BOW_DEFINES = [
+  ['BOW_DISPERSION', () => effectValue('dispersion') > 0],
+  ['BOW_FILM', () => effectValue('iridescence') > 0],
+  ['BOW_LAYERS', bowLayersOn],
+  ['BOW_LAYER_LENS', () => bowLayersOn() && effectValue('layerRefraction')],
+];
+function updateBow() {
+  const defines = volumeMaterial.defines;
+  let changed = false;
+  for (const [name, on] of BOW_DEFINES) {
+    if (on() === name in defines) continue;
+    if (on()) defines[name] = ''; else delete defines[name];
+    changed = true;
+  }
+  if (changed) volumeMaterial.needsUpdate = true;
+  volumeMaterial.uniforms.uBow.value.set(effectValue('dispersion'), effectValue('iridescence'), effectValue('bowLayers'), effectValue('layerSpread'));
+  volumeMaterial.uniforms.uFilmFlow.value = effectValue('filmFlow') ? 1 : 0;
 }
 
 // Speed dust drifts at a fixed fraction of the travelled distance: near, mid
